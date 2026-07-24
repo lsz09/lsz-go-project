@@ -1,0 +1,19 @@
+# Environment variables
+.env
+.env.*
+
+# Go build files
+bin/
+dist/
+*.exe
+*.out
+
+# Test and coverage files
+coverage.out
+
+# Local IDE settings
+.vscode/settings.json
+
+# Operating system files
+.DS_Store
+Thumbs.db
