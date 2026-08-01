@@ -9,7 +9,7 @@ import (
 
 func TestHealthHandler(t *testing.T) {
 	t.Run("GET 요청에 정상 상태를 반환한다", func(t *testing.T) {
-		router := NewRouter()
+		router := NewRouter(nil)
 
 		request := httptest.NewRequest(http.MethodGet, "/health", nil)
 		recorder := httptest.NewRecorder()
@@ -47,7 +47,7 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("GET 이외의 요청에는 405를 반환한다", func(t *testing.T) {
-		router := NewRouter()
+		router := NewRouter(nil)
 
 		request := httptest.NewRequest(http.MethodPost, "/health", nil)
 		recorder := httptest.NewRecorder()

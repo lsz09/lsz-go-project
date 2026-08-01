@@ -22,3 +22,61 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 
 ```bash
 go run ./cmd/api
+
+## 로컬 실행
+
+### 환경변수 설정
+
+```cmd
+copy .env.example .env
+```
+
+### PostgreSQL 실행
+
+```cmd
+docker compose up -d postgres
+```
+
+상태 확인:
+
+```cmd
+docker compose ps
+```
+
+### API 실행
+
+```cmd
+go run ./cmd/api
+```
+
+## 상태 확인 API
+
+API 프로세스 상태:
+
+```http
+GET /health
+```
+
+PostgreSQL을 포함한 요청 처리 준비 상태:
+
+```http
+GET /ready
+```
+
+PostgreSQL 연결 성공 시 `/ready`는 `200 OK`를 반환합니다.
+
+PostgreSQL 연결 실패 시 `/ready`는 `503 Service Unavailable`을 반환합니다.
+
+## 종료
+
+컨테이너를 종료하되 데이터를 유지합니다.
+
+```cmd
+docker compose down
+```
+
+컨테이너와 PostgreSQL 데이터를 모두 삭제합니다.
+
+```cmd
+docker compose down -v
+```
