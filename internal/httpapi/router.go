@@ -12,10 +12,11 @@ type healthResponse struct {
 	Timestamp string `json:"timestamp"`
 }
 
-func NewRouter() http.Handler {
+func NewRouter(database DatabasePinger) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/ready", readinessHandler(database))
 
 	return mux
 }
@@ -33,9 +34,18 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+	payload, err := json.Marshal(response)
+	if err != nil {
+		http.Error(
+			w,
+			"failed to encode response",
+			http.StatusInternalServerError,
+		)
+		return
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	_, _ = w.Write(append(payload, '\n'))
 }
