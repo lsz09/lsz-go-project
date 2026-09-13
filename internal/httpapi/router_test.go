@@ -9,7 +9,7 @@ import (
 
 func TestHealthHandler(t *testing.T) {
 	t.Run("GET 요청에 정상 상태를 반환한다", func(t *testing.T) {
-		router := NewRouter(nil)
+		router := NewRouter(nil, nil)
 
 		request := httptest.NewRequest(http.MethodGet, "/health", nil)
 		recorder := httptest.NewRecorder()
@@ -47,7 +47,7 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("GET 이외의 요청에는 405를 반환한다", func(t *testing.T) {
-		router := NewRouter(nil)
+		router := NewRouter(nil, nil)
 
 		request := httptest.NewRequest(http.MethodPost, "/health", nil)
 		recorder := httptest.NewRecorder()
@@ -70,4 +70,25 @@ func TestHealthHandler(t *testing.T) {
 			)
 		}
 	})
+}
+
+// TestJobRoute는 등록된 Job Handler가 작업 API 요청을 전달받는지 검증합니다.
+func TestJobRoute(t *testing.T) {
+	called := false
+	jobHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusCreated)
+	})
+	router := NewRouter(nil, jobHandler)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	if !called {
+		t.Fatal("expected job handler to be called")
+	}
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d", http.StatusCreated, recorder.Code)
+	}
 }

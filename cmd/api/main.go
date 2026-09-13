@@ -12,6 +12,7 @@ import (
 
 	"cloudqueue/internal/database"
 	"cloudqueue/internal/httpapi"
+	"cloudqueue/internal/job"
 )
 
 func main() {
@@ -53,9 +54,14 @@ func main() {
 
 	slog.Info("connected to PostgreSQL")
 
+	// Repository, Service, Handler 순서로 Job API 의존성을 조립합니다.
+	jobRepository := job.NewRepository(pool)
+	jobService := job.NewService(jobRepository)
+	jobHandler := job.NewHandler(jobService)
+
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           httpapi.NewRouter(pool),
+		Handler:           httpapi.NewRouter(pool, jobHandler),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
