@@ -7,18 +7,19 @@ import (
 	"strings"
 )
 
-// CreateRepository는 작업 생성 Service가 사용하는 최소 Repository 기능입니다.
-type CreateRepository interface {
+// ServiceRepository는 Job Service가 사용하는 Repository 기능입니다.
+type ServiceRepository interface {
 	Create(ctx context.Context, params CreateParams) (Job, error)
+	List(ctx context.Context, options ListOptions) ([]Job, error)
 }
 
 // Service는 Job 비즈니스 규칙을 Repository와 HTTP 계층 사이에서 처리합니다.
 type Service struct {
-	repository CreateRepository
+	repository ServiceRepository
 }
 
 // NewService는 주입받은 Repository로 Job Service를 생성합니다.
-func NewService(repository CreateRepository) *Service {
+func NewService(repository ServiceRepository) *Service {
 	return &Service{repository: repository}
 }
 
@@ -41,4 +42,20 @@ func (s *Service) Create(ctx context.Context, params CreateParams) (Job, error) 
 	}
 
 	return created, nil
+}
+
+// List는 페이지 옵션을 Repository에 전달하고 조회 결과를 반환합니다.
+func (s *Service) List(ctx context.Context, options ListOptions) ([]Job, error) {
+	// 잘못 조립된 애플리케이션이 nil Repository를 호출해 panic을 내지 않도록 방어합니다.
+	if s == nil || s.repository == nil {
+		return nil, errors.New("list jobs service: repository is required")
+	}
+
+	// 호출자의 Context와 페이지 옵션을 변경하지 않고 Repository에 전달합니다.
+	jobs, err := s.repository.List(ctx, options)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs service: %w", err)
+	}
+
+	return jobs, nil
 }
