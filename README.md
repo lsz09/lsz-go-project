@@ -153,6 +153,61 @@ PostgreSQL 연결 성공 시 `/ready`는 `200 OK`, 연결 실패 시
 `503 Service Unavailable`을 반환합니다. PostgreSQL 연결 상태와 관계없이
 API 프로세스가 실행 중이면 `/health`는 `200 OK`를 반환합니다.
 
+## Job Repository
+
+`internal/job`은 기존 `pgxpool.Pool`을 `job.NewRepository(pool)`로 전달받아
+`Create`, `FindByID`, `List`를 제공합니다. HTTP API 연결은 후속 작업입니다.
+
+- `Create(ctx, job.CreateParams{FileName: "access.log"})`는 `PENDING` 작업을
+  생성하고 DB의 UUID와 생성 시각을 포함한 `Job`을 반환합니다.
+- `FindByID(ctx, id)`는 UUID로 조회합니다. `errors.Is`로 `job.ErrNotFound`와
+  `job.ErrInvalidInput`을 구분할 수 있고, DB 오류는 원인을 보존해 반환합니다.
+- `List(ctx, job.ListOptions{Limit: 20, Offset: 0})`는 생성 시각 내림차순,
+  동일 시각에는 UUID 내림차순으로 조회합니다. limit 0은 기본값 20이며,
+  음수·100 초과 limit 및 음수 offset은 거부합니다. 빈 결과는 비어 있는
+  non-nil 슬라이스입니다. 동시 삽입 시 offset 페이지 경계는 바뀔 수 있습니다.
+- nullable 컬럼은 포인터로 NULL과 빈 값을 구분합니다. 빈 파일명 및 공백만
+  있는 파일명은 거부하지만, 유효한 파일명은 입력 그대로 저장합니다.
+- DB 호출은 최대 5초이며, 호출자의 더 짧은 deadline과 취소를 유지합니다.
+  `updated_at`은 DB 기본값만 있으므로 후속 상태 변경 구현에서 갱신해야 합니다.
+
+### 단위 테스트
+
+Docker와 PostgreSQL 없이 실행합니다.
+
+```powershell
+go test ./...
+```
+
+### PostgreSQL 통합 테스트
+
+`integration` 빌드 태그로 별도 실행합니다. 테스트 전용 PostgreSQL DB의
+접속 URL을 `TEST_DATABASE_URL`에 설정해야 하며, 누락 시 테스트는 실패합니다.
+각 실행은 고유한 스키마를 만들고 기존 up Migration을 적용한 뒤 정리합니다.
+테스트 DB 계정에는 스키마 생성 권한이 필요합니다. 개발 DB URL은 사용하지 마세요.
+
+아래 컨테이너는 기존 Compose 컨테이너 및 `postgres_data` 볼륨과 독립적입니다.
+비밀번호는 테스트 실행 시 입력하며 파일에 저장하거나 커밋하지 않습니다.
+
+```powershell
+$testCredential = Get-Credential -UserName cloudqueue_test -Message '테스트 DB용 임시 비밀번호'
+$env:POSTGRES_PASSWORD = $testCredential.GetNetworkCredential().Password
+docker run --detach --rm --name cloudqueue-job-test -p 127.0.0.1:55433:5432 -e POSTGRES_USER=cloudqueue_test -e POSTGRES_DB=cloudqueue_test -e POSTGRES_PASSWORD postgres:17-alpine
+docker exec cloudqueue-job-test pg_isready -U cloudqueue_test -d cloudqueue_test
+```
+
+`pg_isready`가 연결 가능 상태를 반환한 후 실행합니다.
+
+```powershell
+$testPassword = [uri]::EscapeDataString($env:POSTGRES_PASSWORD)
+$env:TEST_DATABASE_URL = "postgres://cloudqueue_test:${testPassword}@localhost:55433/cloudqueue_test?sslmode=disable"
+go test -tags=integration -v ./internal/job
+docker stop cloudqueue-job-test
+Remove-Item Env:TEST_DATABASE_URL, Env:POSTGRES_PASSWORD
+```
+
+`-race` 검사는 CGO와 C 컴파일러가 있는 환경에서 실행할 수 있습니다.
+
 ## 종료
 
 컨테이너를 종료하되 PostgreSQL 데이터를 유지합니다.
