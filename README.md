@@ -135,6 +135,42 @@ migrate -path migrations -database $env:DATABASE_URL up
 | `started_at` | 처리 시작 시각 |
 | `completed_at` | 처리 완료 시각 |
 
+## Job API
+
+### 작업 생성
+
+`file_name`은 필수이며 `file_key`는 선택값입니다.
+
+```http
+POST /api/v1/jobs
+Content-Type: application/json
+```
+
+요청 예시:
+
+```json
+{
+  "file_name": "access.log",
+  "file_key": null
+}
+```
+
+성공 시 `201 Created`와 생성된 `PENDING` 작업을 반환합니다.
+
+```json
+{
+  "id": "생성된 UUID",
+  "status": "PENDING",
+  "file_name": "access.log",
+  "file_key": null,
+  "created_at": "2026-09-13T12:00:00Z"
+}
+```
+
+잘못된 JSON이나 입력에는 `400 Bad Request`, 지원하지 않는 Method에는
+`405 Method Not Allowed`, 내부 오류에는 상세를 숨긴 `500 Internal Server Error`를
+반환합니다.
+
 ## 상태 확인 API
 
 API 프로세스 상태:

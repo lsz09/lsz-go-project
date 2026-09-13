@@ -52,7 +52,7 @@ func TestReadinessEndpoint(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			router := NewRouter(test.database)
+			router := NewRouter(test.database, nil)
 
 			request := httptest.NewRequest(
 				http.MethodGet,
@@ -97,7 +97,7 @@ func TestReadinessEndpoint(t *testing.T) {
 }
 
 func TestReadinessEndpointRejectsUnsupportedMethod(t *testing.T) {
-	router := NewRouter(fakeDatabasePinger{})
+	router := NewRouter(fakeDatabasePinger{}, nil)
 
 	request := httptest.NewRequest(
 		http.MethodPost,
