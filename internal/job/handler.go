@@ -8,15 +8,23 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// maxCreateRequestBytes는 과도한 요청 Body가 메모리를 점유하지 않도록 1MiB로 제한합니다.
-const maxCreateRequestBytes int64 = 1 << 20
+const (
+	// maxCreateRequestBytes는 과도한 요청 Body가 메모리를 점유하지 않도록 1MiB로 제한합니다.
+	maxCreateRequestBytes int64 = 1 << 20
+	// jobsPath는 작업 생성과 목록 조회에 사용하는 컬렉션 경로입니다.
+	jobsPath = "/api/v1/jobs"
+	// jobsPathPrefix는 작업 ID가 뒤따르는 단건 조회 경로의 접두사입니다.
+	jobsPathPrefix = jobsPath + "/"
+)
 
-// JobService는 HTTP Handler가 작업 생성과 목록 조회에 사용하는 Service 기능입니다.
+// JobService는 HTTP Handler가 작업 생성과 조회에 사용하는 Service 기능입니다.
 type JobService interface {
 	Create(ctx context.Context, params CreateParams) (Job, error)
+	FindByID(ctx context.Context, id string) (Job, error)
 	List(ctx context.Context, options ListOptions) ([]Job, error)
 }
 
@@ -40,7 +48,7 @@ type createJobResponse struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// jobResponse는 목록 조회 API에서 작업의 전체 상태를 표현합니다.
+// jobResponse는 조회 API에서 작업의 전체 상태를 표현합니다.
 type jobResponse struct {
 	ID           string     `json:"id"`
 	Status       Status     `json:"status"`
@@ -71,9 +79,21 @@ func NewHandler(service JobService) *Handler {
 	return &Handler{service: service}
 }
 
-// ServeHTTP는 Method에 따라 작업 생성 또는 목록 조회를 처리합니다.
+// ServeHTTP는 컬렉션과 단건 경로를 구분해 Job 요청을 처리합니다.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 지원하는 Method를 각 전용 처리 함수로 전달합니다.
+	// 정확한 컬렉션 경로와 ID가 뒤따르는 단건 경로만 허용합니다.
+	switch {
+	case r.URL.Path == jobsPath:
+		h.serveCollection(w, r)
+	case strings.HasPrefix(r.URL.Path, jobsPathPrefix):
+		h.serveItem(w, r)
+	default:
+		writeAPIResponse(w, http.StatusNotFound, apiErrorResponse{Error: "not found"})
+	}
+}
+
+// serveCollection은 작업 생성과 목록 조회 Method를 분기합니다.
+func (h *Handler) serveCollection(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		h.createJob(w, r)
@@ -83,6 +103,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		writeAPIResponse(w, http.StatusMethodNotAllowed, apiErrorResponse{Error: "method not allowed"})
 	}
+}
+
+// serveItem은 올바른 단건 경로에서 GET Method만 허용합니다.
+func (h *Handler) serveItem(w http.ResponseWriter, r *http.Request) {
+	// 작업 ID가 없거나 추가 경로 구간이 있으면 존재하지 않는 경로로 처리합니다.
+	id, ok := jobIDFromPath(r.URL.Path)
+	if !ok {
+		writeAPIResponse(w, http.StatusNotFound, apiErrorResponse{Error: "not found"})
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeAPIResponse(w, http.StatusMethodNotAllowed, apiErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	h.getJob(w, r, id)
 }
 
 // createJob은 JSON 요청을 검증하고 새 PENDING 작업을 생성합니다.
@@ -166,6 +204,41 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 		Limit:  options.Limit,
 		Offset: options.Offset,
 	})
+}
+
+// getJob은 작업 ID로 단건을 조회하고 Repository 오류를 HTTP 상태로 변환합니다.
+func (h *Handler) getJob(w http.ResponseWriter, r *http.Request, id string) {
+	// Service가 주입되지 않은 구성 오류를 내부 오류로 처리합니다.
+	if h == nil || h.service == nil {
+		writeAPIResponse(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+		return
+	}
+
+	// HTTP 요청 Context와 경로에서 추출한 작업 ID로 단건을 조회합니다.
+	found, err := h.service.FindByID(r.Context(), id)
+	if errors.Is(err, ErrInvalidInput) {
+		writeAPIResponse(w, http.StatusBadRequest, apiErrorResponse{Error: "invalid request"})
+		return
+	}
+	if errors.Is(err, ErrNotFound) {
+		writeAPIResponse(w, http.StatusNotFound, apiErrorResponse{Error: "job not found"})
+		return
+	}
+	if err != nil {
+		writeAPIResponse(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+		return
+	}
+
+	writeAPIResponse(w, http.StatusOK, newJobResponse(found))
+}
+
+// jobIDFromPath는 단건 경로에서 슬래시가 없는 작업 ID 하나만 추출합니다.
+func jobIDFromPath(path string) (string, bool) {
+	id := strings.TrimPrefix(path, jobsPathPrefix)
+	if id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
 }
 
 // parseListOptions는 목록 조회 쿼리를 제한 범위의 정수 옵션으로 변환합니다.

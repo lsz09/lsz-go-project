@@ -19,9 +19,10 @@ func NewRouter(database DatabasePinger, jobHandler http.Handler) http.Handler {
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/ready", readinessHandler(database))
 
-	// Job 의존성이 주입된 경우에만 작업 API 경로를 등록합니다.
+	// Job 의존성이 주입된 경우 컬렉션과 단건 조회 경로를 같은 Handler에 등록합니다.
 	if jobHandler != nil {
 		mux.Handle("/api/v1/jobs", jobHandler)
+		mux.Handle("/api/v1/jobs/", jobHandler)
 	}
 
 	return mux

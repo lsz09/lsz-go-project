@@ -72,23 +72,48 @@ func TestHealthHandler(t *testing.T) {
 	})
 }
 
-// TestJobRoute는 등록된 Job Handler가 작업 API 요청을 전달받는지 검증합니다.
+// TestJobRoute는 컬렉션과 단건 경로가 등록된 Job Handler로 전달되는지 검증합니다.
 func TestJobRoute(t *testing.T) {
-	called := false
-	jobHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusCreated)
-	})
-	router := NewRouter(nil, jobHandler)
+	paths := []string{
+		"/api/v1/jobs",
+		"/api/v1/jobs/00000000-0000-0000-0000-000000000001",
+		"/api/v1/jobs/",
+	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", nil)
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			calledPath := ""
+			jobHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calledPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+			})
+			router := NewRouter(nil, jobHandler)
+
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+
+			if calledPath != path {
+				t.Fatalf("expected path %q, got %q", path, calledPath)
+			}
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+			}
+		})
+	}
+}
+
+// TestUnknownRoute는 Job 경로와 비슷하지만 등록되지 않은 요청이 404인지 검증합니다.
+func TestUnknownRoute(t *testing.T) {
+	router := NewRouter(nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("job handler must not be called")
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/job", nil)
 	recorder := httptest.NewRecorder()
+
 	router.ServeHTTP(recorder, request)
 
-	if !called {
-		t.Fatal("expected job handler to be called")
-	}
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("expected status %d, got %d", http.StatusCreated, recorder.Code)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", recorder.Code)
 	}
 }

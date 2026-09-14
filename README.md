@@ -16,7 +16,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] GitHub Actions CI
 - [x] 작업 생성 API
 - [x] 작업 목록 조회 API
-- [ ] 작업 단건 조회 API
+- [x] 작업 단건 조회 API
 - [ ] 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -208,6 +208,35 @@ GET /api/v1/jobs?limit=20&offset=0
 
 조회 결과가 없으면 `jobs`는 `null`이 아닌 빈 배열 `[]`입니다. 음수·범위 초과·
 정수가 아닌 페이지 값, 중복 쿼리, 알 수 없는 쿼리는 `400 Bad Request`를 반환합니다.
+
+### 작업 단건 조회
+
+작업 UUID로 현재 상태와 전체 상세 정보를 조회합니다.
+
+```http
+GET /api/v1/jobs/00000000-0000-0000-0000-000000000001
+```
+
+성공 시 `200 OK`와 작업 정보를 반환합니다.
+
+```json
+{
+  "id": "00000000-0000-0000-0000-000000000001",
+  "status": "PENDING",
+  "file_name": "access.log",
+  "file_key": null,
+  "result_key": null,
+  "error_message": null,
+  "created_at": "2026-09-14T12:00:00Z",
+  "updated_at": "2026-09-14T12:00:00Z",
+  "started_at": null,
+  "completed_at": null
+}
+```
+
+잘못된 UUID에는 `400 Bad Request`, 존재하지 않는 작업에는 `404 Not Found`를
+반환합니다. 단건 경로에서 GET 이외의 Method에는 `405 Method Not Allowed`와
+`Allow: GET` 헤더를 반환하며, 내부 오류 상세정보는 응답에 노출하지 않습니다.
 
 ## 상태 확인 API
 
