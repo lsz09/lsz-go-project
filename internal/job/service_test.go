@@ -11,12 +11,18 @@ import (
 // stubServiceRepository는 Service 테스트에서 실제 PostgreSQL을 대체합니다.
 type stubServiceRepository struct {
 	create func(context.Context, CreateParams) (Job, error)
+	find   func(context.Context, string) (Job, error)
 	list   func(context.Context, ListOptions) ([]Job, error)
 }
 
 // Create는 테스트가 지정한 동작을 실행합니다.
 func (s stubServiceRepository) Create(ctx context.Context, params CreateParams) (Job, error) {
 	return s.create(ctx, params)
+}
+
+// FindByID는 테스트가 지정한 단건 조회 동작을 실행합니다.
+func (s stubServiceRepository) FindByID(ctx context.Context, id string) (Job, error) {
+	return s.find(ctx, id)
 }
 
 // List는 테스트가 지정한 조회 동작을 실행합니다.
@@ -141,5 +147,49 @@ func TestServiceListPreservesEmptySlice(t *testing.T) {
 	}
 	if jobs == nil || len(jobs) != 0 {
 		t.Fatalf("expected non-nil empty slice, got %#v", jobs)
+	}
+}
+
+// TestServiceFindByID는 작업 ID와 Context가 Repository에 그대로 전달되는지 검증합니다.
+func TestServiceFindByID(t *testing.T) {
+	const id = "00000000-0000-0000-0000-000000000001"
+	fileKey := "uploads/access.log"
+	want := Job{ID: id, Status: StatusPending, FileName: "access.log", FileKey: &fileKey}
+
+	type contextKey string
+	const requestIDKey contextKey = "request-id"
+	ctx := context.WithValue(context.Background(), requestIDKey, "request-3")
+
+	repository := stubServiceRepository{find: func(gotContext context.Context, gotID string) (Job, error) {
+		if gotContext.Value(requestIDKey) != "request-3" {
+			t.Fatal("caller context was not propagated")
+		}
+		if gotID != id {
+			t.Fatalf("expected id %q, got %q", id, gotID)
+		}
+		return want, nil
+	}}
+
+	got, err := NewService(repository).FindByID(ctx, id)
+	if err != nil {
+		t.Fatalf("find job: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %+v, got %+v", want, got)
+	}
+}
+
+// TestServiceFindByIDPreservesErrors는 단건 조회 오류를 감싸면서 원인을 보존하는지 검증합니다.
+func TestServiceFindByIDPreservesErrors(t *testing.T) {
+	causes := []error{ErrInvalidInput, ErrNotFound, errors.New("database unavailable"), context.Canceled}
+	for _, cause := range causes {
+		repository := stubServiceRepository{find: func(context.Context, string) (Job, error) {
+			return Job{}, cause
+		}}
+
+		_, err := NewService(repository).FindByID(context.Background(), "00000000-0000-0000-0000-000000000001")
+		if !errors.Is(err, cause) || err == cause {
+			t.Errorf("expected wrapped cause %v, got %v", cause, err)
+		}
 	}
 }

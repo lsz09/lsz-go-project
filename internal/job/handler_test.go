@@ -14,12 +14,18 @@ import (
 // stubJobService는 Handler 테스트에서 실제 Service와 DB를 대체합니다.
 type stubJobService struct {
 	create func(context.Context, CreateParams) (Job, error)
+	find   func(context.Context, string) (Job, error)
 	list   func(context.Context, ListOptions) ([]Job, error)
 }
 
 // Create는 테스트가 지정한 Service 결과를 반환합니다.
 func (s stubJobService) Create(ctx context.Context, params CreateParams) (Job, error) {
 	return s.create(ctx, params)
+}
+
+// FindByID는 테스트가 지정한 Service 단건 조회 결과를 반환합니다.
+func (s stubJobService) FindByID(ctx context.Context, id string) (Job, error) {
+	return s.find(ctx, id)
 }
 
 // List는 테스트가 지정한 Service 조회 결과를 반환합니다.
@@ -342,6 +348,145 @@ func TestListJobsHandlerMapsServiceErrors(t *testing.T) {
 			}
 			if strings.Contains(recorder.Body.String(), "database password") {
 				t.Fatal("internal error details were exposed")
+			}
+		})
+	}
+}
+
+// TestGetJobHandler는 경로 ID와 Context를 전달하고 전체 작업 필드를 반환하는지 검증합니다.
+func TestGetJobHandler(t *testing.T) {
+	const id = "00000000-0000-0000-0000-000000000001"
+	createdAt := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	updatedAt := createdAt.Add(time.Minute)
+	startedAt := createdAt.Add(10 * time.Second)
+	completedAt := createdAt.Add(50 * time.Second)
+	fileKey := "uploads/access.log"
+	resultKey := "results/access.json"
+	errorMessage := "processing failed"
+
+	type contextKey string
+	const requestIDKey contextKey = "request-id"
+	service := stubJobService{find: func(ctx context.Context, gotID string) (Job, error) {
+		if ctx.Value(requestIDKey) != "request-4" {
+			t.Fatal("caller context was not propagated")
+		}
+		if gotID != id {
+			t.Fatalf("expected id %q, got %q", id, gotID)
+		}
+		return Job{
+			ID:           id,
+			Status:       StatusFailed,
+			FileName:     "access.log",
+			FileKey:      &fileKey,
+			ResultKey:    &resultKey,
+			ErrorMessage: &errorMessage,
+			CreatedAt:    createdAt,
+			UpdatedAt:    updatedAt,
+			StartedAt:    &startedAt,
+			CompletedAt:  &completedAt,
+		}, nil
+	}}
+
+	request := httptest.NewRequest(http.MethodGet, jobsPathPrefix+id, nil)
+	request = request.WithContext(context.WithValue(request.Context(), requestIDKey, "request-4"))
+	recorder := httptest.NewRecorder()
+	NewHandler(service).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("unexpected Content-Type %q", recorder.Header().Get("Content-Type"))
+	}
+
+	var response jobResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.ID != id || response.Status != StatusFailed || response.FileName != "access.log" || response.FileKey == nil || *response.FileKey != fileKey || response.ResultKey == nil || *response.ResultKey != resultKey || response.ErrorMessage == nil || *response.ErrorMessage != errorMessage || !response.CreatedAt.Equal(createdAt) || !response.UpdatedAt.Equal(updatedAt) || response.StartedAt == nil || !response.StartedAt.Equal(startedAt) || response.CompletedAt == nil || !response.CompletedAt.Equal(completedAt) {
+		t.Fatalf("unexpected response: %+v", response)
+	}
+}
+
+// TestGetJobHandlerMapsServiceErrors는 단건 조회 오류를 안전한 HTTP 상태로 변환합니다.
+func TestGetJobHandlerMapsServiceErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		cause     error
+		wantCode  int
+		wantError string
+	}{
+		{name: "invalid id", cause: ErrInvalidInput, wantCode: http.StatusBadRequest, wantError: "invalid request"},
+		{name: "missing job", cause: ErrNotFound, wantCode: http.StatusNotFound, wantError: "job not found"},
+		{name: "internal error", cause: errors.New("database password must not be exposed"), wantCode: http.StatusInternalServerError, wantError: "internal server error"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := stubJobService{find: func(context.Context, string) (Job, error) {
+				return Job{}, test.cause
+			}}
+			request := httptest.NewRequest(http.MethodGet, jobsPathPrefix+"00000000-0000-0000-0000-000000000001", nil)
+			recorder := httptest.NewRecorder()
+			NewHandler(service).ServeHTTP(recorder, request)
+
+			if recorder.Code != test.wantCode {
+				t.Fatalf("expected %d, got %d", test.wantCode, recorder.Code)
+			}
+			var response apiErrorResponse
+			if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if response.Error != test.wantError || strings.Contains(recorder.Body.String(), "database password") {
+				t.Fatalf("unexpected error response: %+v", response)
+			}
+		})
+	}
+}
+
+// TestGetJobHandlerRejectsInvalidPaths는 ID가 없거나 추가 경로가 있는 요청을 404로 처리합니다.
+func TestGetJobHandlerRejectsInvalidPaths(t *testing.T) {
+	paths := []string{
+		jobsPathPrefix,
+		jobsPathPrefix + "00000000-0000-0000-0000-000000000001/",
+		jobsPathPrefix + "00000000-0000-0000-0000-000000000001/extra",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			service := stubJobService{find: func(context.Context, string) (Job, error) {
+				t.Fatal("service must not be called")
+				return Job{}, nil
+			}}
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+			NewHandler(service).ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusNotFound {
+				t.Fatalf("expected 404, got %d", recorder.Code)
+			}
+		})
+	}
+}
+
+// TestGetJobHandlerRejectsUnsupportedMethods는 단건 경로에서 GET 이외의 Method를 거부합니다.
+func TestGetJobHandlerRejectsUnsupportedMethods(t *testing.T) {
+	methods := []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			service := stubJobService{find: func(context.Context, string) (Job, error) {
+				t.Fatal("service must not be called")
+				return Job{}, nil
+			}}
+			request := httptest.NewRequest(method, jobsPathPrefix+"00000000-0000-0000-0000-000000000001", nil)
+			recorder := httptest.NewRecorder()
+			NewHandler(service).ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected 405, got %d", recorder.Code)
+			}
+			if recorder.Header().Get("Allow") != http.MethodGet {
+				t.Fatalf("expected Allow GET, got %q", recorder.Header().Get("Allow"))
 			}
 		})
 	}

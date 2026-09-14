@@ -10,6 +10,7 @@ import (
 // ServiceRepository는 Job Service가 사용하는 Repository 기능입니다.
 type ServiceRepository interface {
 	Create(ctx context.Context, params CreateParams) (Job, error)
+	FindByID(ctx context.Context, id string) (Job, error)
 	List(ctx context.Context, options ListOptions) ([]Job, error)
 }
 
@@ -58,4 +59,20 @@ func (s *Service) List(ctx context.Context, options ListOptions) ([]Job, error) 
 	}
 
 	return jobs, nil
+}
+
+// FindByID는 작업 ID를 Repository에 전달하고 단건 조회 결과를 반환합니다.
+func (s *Service) FindByID(ctx context.Context, id string) (Job, error) {
+	// 잘못 조립된 애플리케이션이 nil Repository를 호출해 panic을 내지 않도록 방어합니다.
+	if s == nil || s.repository == nil {
+		return Job{}, errors.New("find job service: repository is required")
+	}
+
+	// 호출자의 Context와 작업 ID를 변경하지 않고 Repository에 전달합니다.
+	found, err := s.repository.FindByID(ctx, id)
+	if err != nil {
+		return Job{}, fmt.Errorf("find job service: %w", err)
+	}
+
+	return found, nil
 }

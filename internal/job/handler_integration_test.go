@@ -98,3 +98,50 @@ func TestListJobsHandlerPostgres(t *testing.T) {
 		t.Fatalf("unexpected nullable values: %+v", response.Jobs[0])
 	}
 }
+
+// TestGetJobHandlerPostgres는 HTTP 단건 조회부터 실제 PostgreSQL 조회까지 검증합니다.
+func TestGetJobHandlerPostgres(t *testing.T) {
+	pool := integrationPool(t)
+	repository := NewRepository(pool)
+	handler := NewHandler(NewService(repository))
+	ctx := context.Background()
+
+	fileKey := "uploads/access.log"
+	created, err := repository.Create(ctx, CreateParams{FileName: "access.log", FileKey: &fileKey})
+	if err != nil {
+		t.Fatalf("create test job: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, jobsPathPrefix+created.ID, nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response jobResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.ID != created.ID || response.Status != created.Status || response.FileName != created.FileName || response.FileKey == nil || *response.FileKey != fileKey || !response.CreatedAt.Equal(created.CreatedAt) || !response.UpdatedAt.Equal(created.UpdatedAt) {
+		t.Fatalf("unexpected response: %+v", response)
+	}
+	if response.ResultKey != nil || response.ErrorMessage != nil || response.StartedAt != nil || response.CompletedAt != nil {
+		t.Fatalf("unexpected nullable values: %+v", response)
+	}
+
+	// 유효하지 않은 UUID와 존재하지 않는 UUID의 상태 코드도 실제 Repository로 확인합니다.
+	invalidRequest := httptest.NewRequest(http.MethodGet, jobsPathPrefix+"not-a-uuid", nil)
+	invalidRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(invalidRecorder, invalidRequest)
+	if invalidRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid id 400, got %d", invalidRecorder.Code)
+	}
+
+	missingRequest := httptest.NewRequest(http.MethodGet, jobsPathPrefix+"00000000-0000-0000-0000-000000000999", nil)
+	missingRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(missingRecorder, missingRequest)
+	if missingRecorder.Code != http.StatusNotFound {
+		t.Fatalf("expected missing job 404, got %d", missingRecorder.Code)
+	}
+}
