@@ -14,7 +14,9 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] Database Migration 기반 구축
 - [x] `jobs` 테이블 스키마
 - [x] GitHub Actions CI
-- [ ] 작업 생성 및 조회 API
+- [x] 작업 생성 API
+- [x] 작업 목록 조회 API
+- [ ] 작업 단건 조회 API
 - [ ] 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -171,6 +173,42 @@ Content-Type: application/json
 `405 Method Not Allowed`, 내부 오류에는 상세를 숨긴 `500 Internal Server Error`를
 반환합니다.
 
+### 작업 목록 조회
+
+작업은 생성 시각 내림차순으로 조회하며, 생성 시각이 같으면 UUID 내림차순으로
+정렬합니다. `limit`의 기본값은 `20`, 최댓값은 `100`이고 `offset`의 기본값은
+`0`입니다. `limit=0`도 기본값 `20`으로 처리합니다.
+
+```http
+GET /api/v1/jobs?limit=20&offset=0
+```
+
+성공 시 `200 OK`와 작업의 전체 상태 필드 및 실제 적용된 페이지 옵션을 반환합니다.
+
+```json
+{
+  "jobs": [
+    {
+      "id": "작업 UUID",
+      "status": "PENDING",
+      "file_name": "access.log",
+      "file_key": null,
+      "result_key": null,
+      "error_message": null,
+      "created_at": "2026-09-13T12:00:00Z",
+      "updated_at": "2026-09-13T12:00:00Z",
+      "started_at": null,
+      "completed_at": null
+    }
+  ],
+  "limit": 20,
+  "offset": 0
+}
+```
+
+조회 결과가 없으면 `jobs`는 `null`이 아닌 빈 배열 `[]`입니다. 음수·범위 초과·
+정수가 아닌 페이지 값, 중복 쿼리, 알 수 없는 쿼리는 `400 Bad Request`를 반환합니다.
+
 ## 상태 확인 API
 
 API 프로세스 상태:
@@ -192,7 +230,7 @@ API 프로세스가 실행 중이면 `/health`는 `200 OK`를 반환합니다.
 ## Job Repository
 
 `internal/job`은 기존 `pgxpool.Pool`을 `job.NewRepository(pool)`로 전달받아
-`Create`, `FindByID`, `List`를 제공합니다. HTTP API 연결은 후속 작업입니다.
+`Create`, `FindByID`, `List`를 제공하며 Service 계층을 통해 Job API에 연결됩니다.
 
 - `Create(ctx, job.CreateParams{FileName: "access.log"})`는 `PENDING` 작업을
   생성하고 DB의 UUID와 생성 시각을 포함한 `Job`을 반환합니다.

@@ -6,20 +6,23 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 )
 
 // maxCreateRequestBytes는 과도한 요청 Body가 메모리를 점유하지 않도록 1MiB로 제한합니다.
 const maxCreateRequestBytes int64 = 1 << 20
 
-// CreateService는 HTTP Handler가 작업 생성에 사용하는 최소 Service 기능입니다.
-type CreateService interface {
+// JobService는 HTTP Handler가 작업 생성과 목록 조회에 사용하는 Service 기능입니다.
+type JobService interface {
 	Create(ctx context.Context, params CreateParams) (Job, error)
+	List(ctx context.Context, options ListOptions) ([]Job, error)
 }
 
 // Handler는 Job HTTP 요청을 Service 호출과 JSON 응답으로 변환합니다.
 type Handler struct {
-	service CreateService
+	service JobService
 }
 
 // createJobRequest는 작업 생성 API에서 허용하는 JSON 필드입니다.
@@ -37,25 +40,53 @@ type createJobResponse struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// jobResponse는 목록 조회 API에서 작업의 전체 상태를 표현합니다.
+type jobResponse struct {
+	ID           string     `json:"id"`
+	Status       Status     `json:"status"`
+	FileName     string     `json:"file_name"`
+	FileKey      *string    `json:"file_key"`
+	ResultKey    *string    `json:"result_key"`
+	ErrorMessage *string    `json:"error_message"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	StartedAt    *time.Time `json:"started_at"`
+	CompletedAt  *time.Time `json:"completed_at"`
+}
+
+// listJobsResponse는 조회된 작업과 적용된 페이지 옵션을 반환합니다.
+type listJobsResponse struct {
+	Jobs   []jobResponse `json:"jobs"`
+	Limit  int           `json:"limit"`
+	Offset int           `json:"offset"`
+}
+
 // apiErrorResponse는 내부 오류 상세를 숨긴 일관된 오류 응답입니다.
 type apiErrorResponse struct {
 	Error string `json:"error"`
 }
 
 // NewHandler는 주입받은 Service로 Job HTTP Handler를 생성합니다.
-func NewHandler(service CreateService) *Handler {
+func NewHandler(service JobService) *Handler {
 	return &Handler{service: service}
 }
 
-// ServeHTTP는 현재 POST 작업 생성 요청만 처리합니다.
+// ServeHTTP는 Method에 따라 작업 생성 또는 목록 조회를 처리합니다.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 지원하지 않는 Method에는 허용 Method와 405 응답을 반환합니다.
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
+	// 지원하는 Method를 각 전용 처리 함수로 전달합니다.
+	switch r.Method {
+	case http.MethodPost:
+		h.createJob(w, r)
+	case http.MethodGet:
+		h.listJobs(w, r)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		writeAPIResponse(w, http.StatusMethodNotAllowed, apiErrorResponse{Error: "method not allowed"})
-		return
 	}
+}
 
+// createJob은 JSON 요청을 검증하고 새 PENDING 작업을 생성합니다.
+func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 	// JSON 구조, 알 수 없는 필드, Body 크기와 단일 객체 여부를 검증합니다.
 	request, err := decodeCreateJobRequest(w, r)
 	if err != nil {
@@ -91,6 +122,101 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		FileKey:   created.FileKey,
 		CreatedAt: created.CreatedAt,
 	})
+}
+
+// listJobs는 페이지 쿼리를 검증하고 최신 작업부터 조회합니다.
+func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
+	// 잘못 인코딩된 쿼리를 감지한 뒤 허용된 limit과 offset만 페이지 옵션으로 변환합니다.
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeAPIResponse(w, http.StatusBadRequest, apiErrorResponse{Error: "invalid request"})
+		return
+	}
+	options, err := parseListOptions(values)
+	if err != nil {
+		writeAPIResponse(w, http.StatusBadRequest, apiErrorResponse{Error: "invalid request"})
+		return
+	}
+
+	// Service가 주입되지 않은 구성 오류를 내부 오류로 처리합니다.
+	if h == nil || h.service == nil {
+		writeAPIResponse(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+		return
+	}
+
+	// HTTP 요청 Context와 검증된 페이지 옵션으로 작업 목록을 조회합니다.
+	jobs, err := h.service.List(r.Context(), options)
+	if errors.Is(err, ErrInvalidInput) {
+		writeAPIResponse(w, http.StatusBadRequest, apiErrorResponse{Error: "invalid request"})
+		return
+	}
+	if err != nil {
+		writeAPIResponse(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+		return
+	}
+
+	// nil 조회 결과도 JSON 빈 배열로 일관되게 반환합니다.
+	responses := make([]jobResponse, len(jobs))
+	for i, current := range jobs {
+		responses[i] = newJobResponse(current)
+	}
+
+	writeAPIResponse(w, http.StatusOK, listJobsResponse{
+		Jobs:   responses,
+		Limit:  options.Limit,
+		Offset: options.Offset,
+	})
+}
+
+// parseListOptions는 목록 조회 쿼리를 제한 범위의 정수 옵션으로 변환합니다.
+func parseListOptions(values url.Values) (ListOptions, error) {
+	// 알 수 없는 쿼리와 같은 키의 중복 입력을 거부합니다.
+	for key, entries := range values {
+		if key != "limit" && key != "offset" {
+			return ListOptions{}, errors.New("unknown query parameter")
+		}
+		if len(entries) != 1 {
+			return ListOptions{}, errors.New("query parameter must be provided once")
+		}
+	}
+
+	options := ListOptions{Limit: DefaultListLimit}
+	if values.Has("limit") {
+		limit, err := strconv.Atoi(values.Get("limit"))
+		if err != nil || limit < 0 || limit > MaxListLimit {
+			return ListOptions{}, errors.New("invalid limit")
+		}
+		// Repository 규칙과 동일하게 limit 0은 기본값 20으로 정규화합니다.
+		if limit != 0 {
+			options.Limit = limit
+		}
+	}
+
+	if values.Has("offset") {
+		offset, err := strconv.Atoi(values.Get("offset"))
+		if err != nil || offset < 0 {
+			return ListOptions{}, errors.New("invalid offset")
+		}
+		options.Offset = offset
+	}
+
+	return options, nil
+}
+
+// newJobResponse는 내부 Job 모델의 모든 필드를 공개 API 형식으로 변환합니다.
+func newJobResponse(current Job) jobResponse {
+	return jobResponse{
+		ID:           current.ID,
+		Status:       current.Status,
+		FileName:     current.FileName,
+		FileKey:      current.FileKey,
+		ResultKey:    current.ResultKey,
+		ErrorMessage: current.ErrorMessage,
+		CreatedAt:    current.CreatedAt,
+		UpdatedAt:    current.UpdatedAt,
+		StartedAt:    current.StartedAt,
+		CompletedAt:  current.CompletedAt,
+	}
 }
 
 // decodeCreateJobRequest는 제한된 크기의 JSON 객체 하나만 디코딩합니다.
