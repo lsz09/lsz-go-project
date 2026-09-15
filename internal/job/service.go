@@ -12,6 +12,9 @@ type ServiceRepository interface {
 	Create(ctx context.Context, params CreateParams) (Job, error)
 	FindByID(ctx context.Context, id string) (Job, error)
 	List(ctx context.Context, options ListOptions) ([]Job, error)
+	MarkProcessing(ctx context.Context, id string) (Job, error)
+	MarkCompleted(ctx context.Context, id string, resultKey string) (Job, error)
+	MarkFailed(ctx context.Context, id string, errorMessage string) (Job, error)
 }
 
 // Service는 Job 비즈니스 규칙을 Repository와 HTTP 계층 사이에서 처리합니다.
@@ -75,4 +78,52 @@ func (s *Service) FindByID(ctx context.Context, id string) (Job, error) {
 	}
 
 	return found, nil
+}
+
+// MarkProcessing은 Repository에 PENDING 작업의 처리 시작을 요청합니다.
+func (s *Service) MarkProcessing(ctx context.Context, id string) (Job, error) {
+	// 잘못 조립된 애플리케이션이 nil Repository를 호출해 panic을 내지 않도록 방어합니다.
+	if s == nil || s.repository == nil {
+		return Job{}, errors.New("mark job processing service: repository is required")
+	}
+
+	updated, err := s.repository.MarkProcessing(ctx, id)
+	if err != nil {
+		return Job{}, fmt.Errorf("mark job processing service: %w", err)
+	}
+	return updated, nil
+}
+
+// MarkCompleted는 결과 키를 검증하고 Repository에 작업 완료를 요청합니다.
+func (s *Service) MarkCompleted(ctx context.Context, id string, resultKey string) (Job, error) {
+	// 빈 결과 키는 Repository와 DB에 전달하지 않고 입력 오류로 처리합니다.
+	if strings.TrimSpace(resultKey) == "" {
+		return Job{}, fmt.Errorf("mark job completed service: %w: result key is required", ErrInvalidInput)
+	}
+	if s == nil || s.repository == nil {
+		return Job{}, errors.New("mark job completed service: repository is required")
+	}
+
+	updated, err := s.repository.MarkCompleted(ctx, id, resultKey)
+	if err != nil {
+		return Job{}, fmt.Errorf("mark job completed service: %w", err)
+	}
+	return updated, nil
+}
+
+// MarkFailed는 실패 메시지를 검증하고 Repository에 작업 실패를 요청합니다.
+func (s *Service) MarkFailed(ctx context.Context, id string, errorMessage string) (Job, error) {
+	// 빈 실패 메시지는 Repository와 DB에 전달하지 않고 입력 오류로 처리합니다.
+	if strings.TrimSpace(errorMessage) == "" {
+		return Job{}, fmt.Errorf("mark job failed service: %w: error message is required", ErrInvalidInput)
+	}
+	if s == nil || s.repository == nil {
+		return Job{}, errors.New("mark job failed service: repository is required")
+	}
+
+	updated, err := s.repository.MarkFailed(ctx, id, errorMessage)
+	if err != nil {
+		return Job{}, fmt.Errorf("mark job failed service: %w", err)
+	}
+	return updated, nil
 }

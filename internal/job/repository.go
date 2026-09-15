@@ -13,8 +13,9 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("job not found")
-	ErrInvalidInput = errors.New("invalid job input")
+	ErrNotFound          = errors.New("job not found")
+	ErrInvalidInput      = errors.New("invalid job input")
+	ErrInvalidTransition = errors.New("invalid job status transition")
 )
 
 const (
@@ -56,12 +57,9 @@ func (r *Repository) Create(ctx context.Context, params CreateParams) (Job, erro
 }
 
 func (r *Repository) FindByID(ctx context.Context, id string) (Job, error) {
-	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
-		return Job{}, fmt.Errorf("find job: %w: id must be a hyphenated UUID", ErrInvalidInput)
-	}
-	var uuid pgtype.UUID
-	if err := uuid.Scan(id); err != nil || !uuid.Valid {
-		return Job{}, fmt.Errorf("find job: %w: id must be a UUID", ErrInvalidInput)
+	uuid, err := parseJobUUID("find job", id)
+	if err != nil {
+		return Job{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
@@ -75,6 +73,40 @@ func (r *Repository) FindByID(ctx context.Context, id string) (Job, error) {
 		return Job{}, fmt.Errorf("find job: %w", err)
 	}
 	return result, nil
+}
+
+// MarkProcessing은 PENDING 작업 하나를 원자적으로 PROCESSING 상태로 변경합니다.
+func (r *Repository) MarkProcessing(ctx context.Context, id string) (Job, error) {
+	return r.transition(ctx, "mark job processing", id, StatusPending,
+		"UPDATE jobs SET status = $2, started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, completed_at = NULL, result_key = NULL, error_message = NULL WHERE id = $1 AND status = $3 RETURNING "+jobColumns,
+		StatusProcessing, StatusPending,
+	)
+}
+
+// MarkCompleted는 PROCESSING 작업에 결과 키를 기록하고 COMPLETED 상태로 변경합니다.
+func (r *Repository) MarkCompleted(ctx context.Context, id string, resultKey string) (Job, error) {
+	// 처리 결과를 찾을 수 있도록 빈 결과 저장소 키를 DB 호출 전에 거부합니다.
+	if strings.TrimSpace(resultKey) == "" {
+		return Job{}, fmt.Errorf("mark job completed: %w: result key is required", ErrInvalidInput)
+	}
+
+	return r.transition(ctx, "mark job completed", id, StatusProcessing,
+		"UPDATE jobs SET status = $2, result_key = $3, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, error_message = NULL WHERE id = $1 AND status = $4 RETURNING "+jobColumns,
+		StatusCompleted, resultKey, StatusProcessing,
+	)
+}
+
+// MarkFailed는 PROCESSING 작업에 실패 원인을 기록하고 FAILED 상태로 변경합니다.
+func (r *Repository) MarkFailed(ctx context.Context, id string, errorMessage string) (Job, error) {
+	// 장애 원인을 잃지 않도록 빈 실패 메시지를 DB 호출 전에 거부합니다.
+	if strings.TrimSpace(errorMessage) == "" {
+		return Job{}, fmt.Errorf("mark job failed: %w: error message is required", ErrInvalidInput)
+	}
+
+	return r.transition(ctx, "mark job failed", id, StatusProcessing,
+		"UPDATE jobs SET status = $2, error_message = $3, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, result_key = NULL WHERE id = $1 AND status = $4 RETURNING "+jobColumns,
+		StatusFailed, errorMessage, StatusProcessing,
+	)
 }
 
 func (r *Repository) List(ctx context.Context, options ListOptions) ([]Job, error) {
@@ -107,6 +139,56 @@ func (r *Repository) List(ctx context.Context, options ListOptions) ([]Job, erro
 		return nil, fmt.Errorf("list jobs: iterate rows: %w", err)
 	}
 	return jobs, nil
+}
+
+// transition은 현재 상태 조건을 포함한 UPDATE로 하나의 Worker만 상태 변경에 성공하게 합니다.
+func (r *Repository) transition(ctx context.Context, operation string, id string, expected Status, query string, values ...any) (Job, error) {
+	uuid, err := parseJobUUID(operation, id)
+	if err != nil {
+		return Job{}, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	args := make([]any, 0, len(values)+1)
+	args = append(args, uuid)
+	args = append(args, values...)
+
+	updated, err := scanJob(r.db.QueryRow(ctx, query, args...))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, r.classifyTransitionMiss(ctx, operation, uuid, expected)
+	}
+	if err != nil {
+		return Job{}, fmt.Errorf("%s: %w", operation, err)
+	}
+	return updated, nil
+}
+
+// classifyTransitionMiss는 조건부 UPDATE 실패 후 대상 없음과 상태 충돌만 구분합니다.
+func (r *Repository) classifyTransitionMiss(ctx context.Context, operation string, uuid pgtype.UUID, expected Status) error {
+	var current Status
+	err := r.db.QueryRow(ctx, "SELECT status FROM jobs WHERE id = $1", uuid).Scan(&current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%s: %w", operation, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: classify transition: %w", operation, err)
+	}
+	return fmt.Errorf("%s: %w: current status %s, expected %s", operation, ErrInvalidTransition, current, expected)
+}
+
+// parseJobUUID는 외부 문자열 ID를 PostgreSQL UUID 인수로 안전하게 변환합니다.
+func parseJobUUID(operation string, id string) (pgtype.UUID, error) {
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		return pgtype.UUID{}, fmt.Errorf("%s: %w: id must be a hyphenated UUID", operation, ErrInvalidInput)
+	}
+
+	var uuid pgtype.UUID
+	if err := uuid.Scan(id); err != nil || !uuid.Valid {
+		return pgtype.UUID{}, fmt.Errorf("%s: %w: id must be a UUID", operation, ErrInvalidInput)
+	}
+	return uuid, nil
 }
 
 func scanJob(row pgx.Row) (Job, error) {
