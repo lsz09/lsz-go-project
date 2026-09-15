@@ -164,3 +164,103 @@ func TestPostgresRepository(t *testing.T) {
 		t.Fatalf("cancel list: %v", err)
 	}
 }
+
+// TestPostgresRepositoryStatusTransitions는 실제 DB에서 허용 상태와 갱신 컬럼을 검증합니다.
+func TestPostgresRepositoryStatusTransitions(t *testing.T) {
+	pool := integrationPool(t)
+	repo := NewRepository(pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	completedJob, err := repo.Create(ctx, CreateParams{FileName: "completed.log"})
+	if err != nil {
+		t.Fatalf("create completed test job: %v", err)
+	}
+	processing, err := repo.MarkProcessing(ctx, completedJob.ID)
+	if err != nil {
+		t.Fatalf("mark processing: %v", err)
+	}
+	if processing.Status != StatusProcessing || processing.StartedAt == nil || processing.UpdatedAt.Before(completedJob.UpdatedAt) || processing.CompletedAt != nil || processing.ResultKey != nil || processing.ErrorMessage != nil {
+		t.Fatalf("unexpected processing job: %+v", processing)
+	}
+
+	completed, err := repo.MarkCompleted(ctx, completedJob.ID, "results/completed.json")
+	if err != nil {
+		t.Fatalf("mark completed: %v", err)
+	}
+	if completed.Status != StatusCompleted || completed.ResultKey == nil || *completed.ResultKey != "results/completed.json" || completed.CompletedAt == nil || completed.UpdatedAt.Before(processing.UpdatedAt) || completed.ErrorMessage != nil {
+		t.Fatalf("unexpected completed job: %+v", completed)
+	}
+	if _, err := repo.MarkFailed(ctx, completed.ID, "must not overwrite terminal state"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("expected terminal state conflict, got %v", err)
+	}
+
+	failedJob, err := repo.Create(ctx, CreateParams{FileName: "failed.log"})
+	if err != nil {
+		t.Fatalf("create failed test job: %v", err)
+	}
+	failedJob, err = repo.MarkProcessing(ctx, failedJob.ID)
+	if err != nil {
+		t.Fatalf("mark failed job processing: %v", err)
+	}
+	failed, err := repo.MarkFailed(ctx, failedJob.ID, "processing failed")
+	if err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if failed.Status != StatusFailed || failed.ErrorMessage == nil || *failed.ErrorMessage != "processing failed" || failed.CompletedAt == nil || failed.UpdatedAt.Before(failedJob.UpdatedAt) || failed.ResultKey != nil {
+		t.Fatalf("unexpected failed job: %+v", failed)
+	}
+
+	pendingJob, err := repo.Create(ctx, CreateParams{FileName: "pending.log"})
+	if err != nil {
+		t.Fatalf("create pending test job: %v", err)
+	}
+	if _, err := repo.MarkCompleted(ctx, pendingJob.ID, "results/pending.json"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("expected pending completion conflict, got %v", err)
+	}
+	if _, err := repo.MarkProcessing(ctx, "00000000-0000-0000-0000-000000000999"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing job, got %v", err)
+	}
+}
+
+// TestPostgresRepositoryConcurrentMarkProcessing은 동시에 하나의 Worker만 작업을 획득하는지 검증합니다.
+func TestPostgresRepositoryConcurrentMarkProcessing(t *testing.T) {
+	pool := integrationPool(t)
+	repo := NewRepository(pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	created, err := repo.Create(ctx, CreateParams{FileName: "concurrent.log"})
+	if err != nil {
+		t.Fatalf("create concurrent test job: %v", err)
+	}
+
+	const workers = 8
+	start := make(chan struct{})
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			_, err := repo.MarkProcessing(ctx, created.ID)
+			results <- err
+		}()
+	}
+	close(start)
+
+	succeeded := 0
+	conflicted := 0
+	for i := 0; i < workers; i++ {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrInvalidTransition):
+			conflicted++
+		default:
+			t.Fatalf("unexpected concurrent transition error: %v", err)
+		}
+	}
+	if succeeded != 1 || conflicted != workers-1 {
+		t.Fatalf("expected one success and %d conflicts, got %d and %d", workers-1, succeeded, conflicted)
+	}
+}

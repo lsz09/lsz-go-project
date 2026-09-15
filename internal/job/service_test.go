@@ -10,9 +10,12 @@ import (
 
 // stubServiceRepository는 Service 테스트에서 실제 PostgreSQL을 대체합니다.
 type stubServiceRepository struct {
-	create func(context.Context, CreateParams) (Job, error)
-	find   func(context.Context, string) (Job, error)
-	list   func(context.Context, ListOptions) ([]Job, error)
+	create         func(context.Context, CreateParams) (Job, error)
+	find           func(context.Context, string) (Job, error)
+	list           func(context.Context, ListOptions) ([]Job, error)
+	markProcessing func(context.Context, string) (Job, error)
+	markCompleted  func(context.Context, string, string) (Job, error)
+	markFailed     func(context.Context, string, string) (Job, error)
 }
 
 // Create는 테스트가 지정한 동작을 실행합니다.
@@ -28,6 +31,21 @@ func (s stubServiceRepository) FindByID(ctx context.Context, id string) (Job, er
 // List는 테스트가 지정한 조회 동작을 실행합니다.
 func (s stubServiceRepository) List(ctx context.Context, options ListOptions) ([]Job, error) {
 	return s.list(ctx, options)
+}
+
+// MarkProcessing은 테스트가 지정한 처리 시작 동작을 실행합니다.
+func (s stubServiceRepository) MarkProcessing(ctx context.Context, id string) (Job, error) {
+	return s.markProcessing(ctx, id)
+}
+
+// MarkCompleted는 테스트가 지정한 처리 완료 동작을 실행합니다.
+func (s stubServiceRepository) MarkCompleted(ctx context.Context, id string, resultKey string) (Job, error) {
+	return s.markCompleted(ctx, id, resultKey)
+}
+
+// MarkFailed는 테스트가 지정한 처리 실패 동작을 실행합니다.
+func (s stubServiceRepository) MarkFailed(ctx context.Context, id string, errorMessage string) (Job, error) {
+	return s.markFailed(ctx, id, errorMessage)
 }
 
 // TestServiceCreate는 입력과 Context가 Repository에 전달되는지 검증합니다.
@@ -190,6 +208,106 @@ func TestServiceFindByIDPreservesErrors(t *testing.T) {
 		_, err := NewService(repository).FindByID(context.Background(), "00000000-0000-0000-0000-000000000001")
 		if !errors.Is(err, cause) || err == cause {
 			t.Errorf("expected wrapped cause %v, got %v", cause, err)
+		}
+	}
+}
+
+// TestServiceStatusTransitions는 Context와 상태별 입력이 Repository에 전달되는지 검증합니다.
+func TestServiceStatusTransitions(t *testing.T) {
+	const id = "00000000-0000-0000-0000-000000000001"
+	const resultKey = "results/access.json"
+	const errorMessage = "processing failed"
+
+	type contextKey string
+	const requestIDKey contextKey = "request-id"
+	ctx := context.WithValue(context.Background(), requestIDKey, "request-4")
+	want := Job{ID: id, Status: StatusProcessing, FileName: "access.log"}
+
+	repository := stubServiceRepository{
+		markProcessing: func(gotContext context.Context, gotID string) (Job, error) {
+			if gotContext.Value(requestIDKey) != "request-4" || gotID != id {
+				t.Fatalf("unexpected processing input: %q", gotID)
+			}
+			return want, nil
+		},
+		markCompleted: func(gotContext context.Context, gotID string, gotResultKey string) (Job, error) {
+			if gotContext.Value(requestIDKey) != "request-4" || gotID != id || gotResultKey != resultKey {
+				t.Fatalf("unexpected completed input: %q %q", gotID, gotResultKey)
+			}
+			completed := want
+			completed.Status = StatusCompleted
+			return completed, nil
+		},
+		markFailed: func(gotContext context.Context, gotID string, gotErrorMessage string) (Job, error) {
+			if gotContext.Value(requestIDKey) != "request-4" || gotID != id || gotErrorMessage != errorMessage {
+				t.Fatalf("unexpected failed input: %q %q", gotID, gotErrorMessage)
+			}
+			failed := want
+			failed.Status = StatusFailed
+			return failed, nil
+		},
+	}
+	service := NewService(repository)
+
+	processing, err := service.MarkProcessing(ctx, id)
+	if err != nil || processing.Status != StatusProcessing {
+		t.Fatalf("mark processing: %+v %v", processing, err)
+	}
+	completed, err := service.MarkCompleted(ctx, id, resultKey)
+	if err != nil || completed.Status != StatusCompleted {
+		t.Fatalf("mark completed: %+v %v", completed, err)
+	}
+	failed, err := service.MarkFailed(ctx, id, errorMessage)
+	if err != nil || failed.Status != StatusFailed {
+		t.Fatalf("mark failed: %+v %v", failed, err)
+	}
+}
+
+// TestServiceStatusTransitionValidation은 빈 결과 키와 실패 메시지를 Repository 호출 전에 거부합니다.
+func TestServiceStatusTransitionValidation(t *testing.T) {
+	repository := stubServiceRepository{
+		markCompleted: func(context.Context, string, string) (Job, error) {
+			t.Fatal("repository must not be called")
+			return Job{}, nil
+		},
+		markFailed: func(context.Context, string, string) (Job, error) {
+			t.Fatal("repository must not be called")
+			return Job{}, nil
+		},
+	}
+	service := NewService(repository)
+
+	for _, value := range []string{"", " ", "\t\n"} {
+		if _, err := service.MarkCompleted(context.Background(), "id", value); !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("MarkCompleted(%q): expected ErrInvalidInput, got %v", value, err)
+		}
+		if _, err := service.MarkFailed(context.Background(), "id", value); !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("MarkFailed(%q): expected ErrInvalidInput, got %v", value, err)
+		}
+	}
+}
+
+// TestServiceStatusTransitionPreservesErrors는 모든 상태 변경에서 Repository 오류 원인을 유지합니다.
+func TestServiceStatusTransitionPreservesErrors(t *testing.T) {
+	causes := []error{ErrInvalidInput, ErrNotFound, ErrInvalidTransition, errors.New("database unavailable"), context.Canceled}
+	for _, cause := range causes {
+		repository := stubServiceRepository{
+			markProcessing: func(context.Context, string) (Job, error) { return Job{}, cause },
+			markCompleted:  func(context.Context, string, string) (Job, error) { return Job{}, cause },
+			markFailed:     func(context.Context, string, string) (Job, error) { return Job{}, cause },
+		}
+		service := NewService(repository)
+		operations := []func() (Job, error){
+			func() (Job, error) { return service.MarkProcessing(context.Background(), "id") },
+			func() (Job, error) { return service.MarkCompleted(context.Background(), "id", "result.json") },
+			func() (Job, error) { return service.MarkFailed(context.Background(), "id", "failed") },
+		}
+
+		for _, operation := range operations {
+			_, err := operation()
+			if !errors.Is(err, cause) || err == cause {
+				t.Errorf("expected wrapped cause %v, got %v", cause, err)
+			}
 		}
 	}
 }

@@ -17,6 +17,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] 작업 생성 API
 - [x] 작업 목록 조회 API
 - [x] 작업 단건 조회 API
+- [x] Job 상태 전이 Repository 및 Service
 - [ ] 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -272,7 +273,31 @@ API 프로세스가 실행 중이면 `/health`는 `200 OK`를 반환합니다.
 - nullable 컬럼은 포인터로 NULL과 빈 값을 구분합니다. 빈 파일명 및 공백만
   있는 파일명은 거부하지만, 유효한 파일명은 입력 그대로 저장합니다.
 - DB 호출은 최대 5초이며, 호출자의 더 짧은 deadline과 취소를 유지합니다.
-  `updated_at`은 DB 기본값만 있으므로 후속 상태 변경 구현에서 갱신해야 합니다.
+
+### Job 상태 전이
+
+Worker가 사용할 상태 변경은 Repository와 Service에서 다음 규칙으로 제한합니다.
+
+```text
+PENDING → PROCESSING
+PROCESSING → COMPLETED
+PROCESSING → FAILED
+```
+
+| 기능 | 갱신 내용 |
+| --- | --- |
+| `MarkProcessing` | `status`, `started_at`, `updated_at` |
+| `MarkCompleted` | `status`, `result_key`, `completed_at`, `updated_at` |
+| `MarkFailed` | `status`, `error_message`, `completed_at`, `updated_at` |
+
+상태 변경 SQL은 현재 상태를 `WHERE` 조건으로 확인하는 원자적 UPDATE입니다. 여러
+Worker가 같은 `PENDING` 작업을 동시에 획득해도 하나만 `PROCESSING` 변경에 성공하고,
+나머지는 `ErrInvalidTransition`을 반환합니다. 존재하지 않는 작업은 `ErrNotFound`,
+잘못된 UUID와 빈 결과 키 또는 실패 메시지는 `ErrInvalidInput`으로 구분합니다.
+
+`COMPLETED`와 `FAILED`는 최종 상태이므로 다른 상태로 변경할 수 없습니다. 모든 상태
+변경은 DB 시각으로 `updated_at`을 갱신하고 기존 Context 및 최대 5초 timeout을
+유지합니다.
 
 ### 단위 테스트
 
