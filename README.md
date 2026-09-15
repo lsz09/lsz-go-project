@@ -18,6 +18,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] 작업 목록 조회 API
 - [x] 작업 단건 조회 API
 - [x] Job 상태 전이 Repository 및 Service
+- [x] Worker 작업 처리 오케스트레이션
 - [ ] 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -298,6 +299,26 @@ Worker가 같은 `PENDING` 작업을 동시에 획득해도 하나만 `PROCESSIN
 `COMPLETED`와 `FAILED`는 최종 상태이므로 다른 상태로 변경할 수 없습니다. 모든 상태
 변경은 DB 시각으로 `updated_at`을 갱신하고 기존 Context 및 최대 5초 timeout을
 유지합니다.
+
+## Worker 작업 처리 오케스트레이션
+
+`internal/worker`의 `Worker`는 작업 ID를 받아 상태 전이와 실제 처리 순서를 조정합니다.
+실제 파일 처리 방식은 `Processor` 인터페이스로 분리되어 있어 이후 메시지 큐와 파일
+분석 기능을 연결할 수 있습니다.
+
+```text
+MarkProcessing → Processor.Process → MarkCompleted
+                              └─ 오류 → MarkFailed
+```
+
+- `MarkProcessing`에 실패한 작업은 Processor를 실행하지 않습니다.
+- Processor가 반환한 결과 저장소 키는 변경하지 않고 `MarkCompleted`에 전달합니다.
+- Processor 오류는 메시지를 `MarkFailed`에 저장한 뒤 호출자에게 그대로 추적 가능하게
+  반환합니다. 실패 상태 저장도 함께 실패하면 `errors.Join`으로 두 오류를 모두 보존합니다.
+- 호출자의 Context는 모든 단계에 동일하게 전달되며, Processor 실행 전에 취소되면
+  처리를 시작하지 않습니다.
+- 현재 구현 범위는 Worker 코어이며 실행 프로세스, SQS 연동, 실제 파일 분석과 재시도는
+  이후 작업에서 추가합니다.
 
 ### 단위 테스트
 
