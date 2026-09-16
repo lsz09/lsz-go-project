@@ -178,19 +178,6 @@ func (r *Repository) classifyTransitionMiss(ctx context.Context, operation strin
 	return fmt.Errorf("%s: %w: current status %s, expected %s", operation, ErrInvalidTransition, current, expected)
 }
 
-// parseJobUUID는 외부 문자열 ID를 PostgreSQL UUID 인수로 안전하게 변환합니다.
-func parseJobUUID(operation string, id string) (pgtype.UUID, error) {
-	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
-		return pgtype.UUID{}, fmt.Errorf("%s: %w: id must be a hyphenated UUID", operation, ErrInvalidInput)
-	}
-
-	var uuid pgtype.UUID
-	if err := uuid.Scan(id); err != nil || !uuid.Valid {
-		return pgtype.UUID{}, fmt.Errorf("%s: %w: id must be a UUID", operation, ErrInvalidInput)
-	}
-	return uuid, nil
-}
-
 func scanJob(row pgx.Row) (Job, error) {
 	var result Job
 	var id pgtype.UUID

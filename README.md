@@ -22,6 +22,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] 웹 서버 로그 분석 코어
 - [x] 로컬 파일 기반 로그 Processor
 - [x] 로컬 one-shot Worker 실행 프로그램
+- [x] Job 메시지 계약 및 메시지 큐 인터페이스
 - [ ] 메시지 큐 기반 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -436,6 +437,41 @@ go run ./cmd/worker -job-id {job-id}
 `Ctrl+C` 또는 `SIGTERM`을 받으면 실행 중인 작업 Context를 취소합니다.
 
 SQS에서 Job ID를 수신하는 지속 실행 방식은 후속 작업에서 추가합니다.
+
+## Job 메시지 및 Queue 계약
+
+`internal/jobqueue`는 API와 Worker가 메시지 큐를 통해 Job ID를 전달할 때 사용할
+인프라 독립적인 계약을 제공합니다. 메시지에는 Job ID만 포함하고, 상태와 파일 정보는
+Worker가 PostgreSQL에서 다시 조회합니다.
+
+```json
+{
+  "job_id": "00000000-0000-0000-0000-000000000001"
+}
+```
+
+메시지의 Job ID는 Repository와 동일한 `job.ValidateID` 규칙으로 검증합니다. 빈 값,
+공백이 포함된 값, 하이픈이 없는 값 및 UUID가 아닌 값은 `job.ErrInvalidInput`과
+`jobqueue.ErrInvalidMessage`로 구분할 수 있습니다. JSON 디코딩은 알 수 없는 필드,
+두 개 이상의 JSON 값 및 객체가 아닌 입력을 거부하며 오류에 메시지 원문을 노출하지
+않습니다.
+
+메시지 큐 연동 경계는 다음 인터페이스로 분리되어 있습니다.
+
+```text
+Publisher.Publish → 메시지 발행
+Consumer.Receive  → Delivery 수신
+Worker.ProcessJob → Job 처리
+Consumer.Delete   → 성공한 메시지만 삭제
+```
+
+`Delivery`의 `ReceiptHandle`은 큐 구현이 발급하는 불투명한 확인 토큰입니다. 메시지를
+수신한 즉시 삭제하지 않고 Worker 처리가 성공한 뒤에만 삭제합니다. 처리에 실패하면
+삭제하지 않아 향후 큐의 재전달 정책을 적용할 수 있습니다.
+
+현재는 Message, Delivery, Publisher 및 Consumer 계약만 구현되어 있습니다. AWS SDK,
+LocalStack과 실제 SQS 연결, API 메시지 발행 및 Worker polling은 후속 작업에서
+추가합니다.
 
 ### 단위 테스트
 
