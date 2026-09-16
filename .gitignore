@@ -12,6 +12,9 @@ dist/
 # Test and coverage files
 coverage.out
 
+# Local Worker input and result files
+/data/
+
 # Local IDE settings
 .vscode/settings.json
 

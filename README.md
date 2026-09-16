@@ -21,7 +21,8 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] Worker 작업 처리 오케스트레이션
 - [x] 웹 서버 로그 분석 코어
 - [x] 로컬 파일 기반 로그 Processor
-- [ ] 비동기 Worker
+- [x] 로컬 one-shot Worker 실행 프로그램
+- [ ] 메시지 큐 기반 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
 - [ ] AWS 배포
@@ -319,8 +320,8 @@ MarkProcessing → Processor.Process → MarkCompleted
   반환합니다. 실패 상태 저장도 함께 실패하면 `errors.Join`으로 두 오류를 모두 보존합니다.
 - 호출자의 Context는 모든 단계에 동일하게 전달되며, Processor 실행 전에 취소되면
   처리를 시작하지 않습니다.
-- 현재 구현 범위는 Worker 코어이며 실행 프로세스, SQS 연동, 파일 입출력과 Processor
-  연결 및 재시도는 이후 작업에서 추가합니다.
+- 현재 로컬 실행 프로그램은 Job ID 하나를 처리하고 종료하는 one-shot 방식입니다.
+  SQS 연동과 재시도는 이후 작업에서 추가합니다.
 
 ## 웹 서버 로그 분석
 
@@ -378,6 +379,64 @@ Processor는 Job 상태를 직접 변경하지 않습니다. Worker가 상태 �
 Processor는 성공 시 `results/{job-id}.json` 키만 반환합니다. 현재는 로컬 Storage만
 지원하고 S3 구현은 후속 작업에서 같은 Storage 인터페이스에 연결합니다.
 
+## 로컬 Worker 실행
+
+API 서버와 Worker는 각각 `cmd/api`, `cmd/worker`의 독립 프로세스로 실행합니다.
+Worker는 현재 메시지 큐 대신 `-job-id`로 전달받은 작업 하나만 처리하고 종료합니다.
+정상 처리 시 종료 코드 `0`, 설정·DB 연결·작업 처리 실패 시 non-zero를 반환합니다.
+
+`.env`에는 PostgreSQL 접속 정보와 로컬 Storage root를 설정합니다. 실제 비밀번호는
+`.env.example`이 아니라 Git에서 제외된 `.env`에만 저장합니다.
+
+```dotenv
+DATABASE_URL=postgres://cloudqueue:실제비밀번호@localhost:5433/cloudqueue?sslmode=disable
+LOCAL_STORAGE_ROOT=./data
+```
+
+입력 로그 파일은 Storage root 아래에 준비합니다. `data/`는 Git에서 제외됩니다.
+
+```text
+data/
+├── uploads/
+│   └── access.log
+└── results/
+    └── {job-id}.json
+```
+
+예시 입력 로그:
+
+```text
+127.0.0.1 - - [16/Sep/2026:10:00:00 +0900] "GET /health HTTP/1.1" 200 42 "-" "Mozilla/5.0"
+127.0.0.1 - - [16/Sep/2026:10:01:00 +0900] "POST /api/v1/jobs HTTP/1.1" 500 128 "-" "Mozilla/5.0"
+```
+
+API 서버를 실행한 뒤 입력 파일의 Storage key가 포함된 작업을 생성합니다.
+
+```http
+POST /api/v1/jobs
+Content-Type: application/json
+```
+
+```json
+{
+  "file_name": "access.log",
+  "file_key": "uploads/access.log"
+}
+```
+
+응답의 Job ID를 Worker에 전달합니다.
+
+```powershell
+go run ./cmd/worker -job-id {job-id}
+```
+
+정상 처리 후 작업은 `COMPLETED`, `result_key`는 `results/{job-id}.json`이 되며
+같은 위치에 분석 결과 JSON 파일이 생성됩니다. 입력 파일이 없거나 로그 형식이
+잘못되면 작업은 `FAILED`가 되고 `error_message`에 실패 원인이 저장됩니다.
+`Ctrl+C` 또는 `SIGTERM`을 받으면 실행 중인 작업 Context를 취소합니다.
+
+SQS에서 Job ID를 수신하는 지속 실행 방식은 후속 작업에서 추가합니다.
+
 ### 단위 테스트
 
 Docker와 PostgreSQL 없이 실행합니다.
@@ -408,7 +467,7 @@ docker exec cloudqueue-job-test pg_isready -U cloudqueue_test -d cloudqueue_test
 ```powershell
 $testPassword = [uri]::EscapeDataString($env:POSTGRES_PASSWORD)
 $env:TEST_DATABASE_URL = "postgres://cloudqueue_test:${testPassword}@localhost:55433/cloudqueue_test?sslmode=disable"
-go test -tags=integration -v ./internal/job
+go test -tags=integration -v ./internal/job ./cmd/worker
 docker stop cloudqueue-job-test
 Remove-Item Env:TEST_DATABASE_URL, Env:POSTGRES_PASSWORD
 ```
