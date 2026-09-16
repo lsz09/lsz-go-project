@@ -19,6 +19,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] 작업 단건 조회 API
 - [x] Job 상태 전이 Repository 및 Service
 - [x] Worker 작업 처리 오케스트레이션
+- [x] 웹 서버 로그 분석 코어
 - [ ] 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -317,8 +318,26 @@ MarkProcessing → Processor.Process → MarkCompleted
   반환합니다. 실패 상태 저장도 함께 실패하면 `errors.Join`으로 두 오류를 모두 보존합니다.
 - 호출자의 Context는 모든 단계에 동일하게 전달되며, Processor 실행 전에 취소되면
   처리를 시작하지 않습니다.
-- 현재 구현 범위는 Worker 코어이며 실행 프로세스, SQS 연동, 실제 파일 분석과 재시도는
-  이후 작업에서 추가합니다.
+- 현재 구현 범위는 Worker 코어이며 실행 프로세스, SQS 연동, 파일 입출력과 Processor
+  연결 및 재시도는 이후 작업에서 추가합니다.
+
+## 웹 서버 로그 분석
+
+`internal/loganalysis`는 외부 인프라에 의존하지 않고 `io.Reader`로 전달된 Nginx 및
+Apache Combined Log Format을 한 줄씩 분석합니다.
+
+```text
+127.0.0.1 - - [16/Sep/2026:10:00:00 +0900] "GET /api/v1/jobs HTTP/1.1" 200 512 "-" "Mozilla/5.0"
+```
+
+분석 결과에는 전체 요청 수, 오류 요청 수와 오류율, HTTP 상태 코드·Method·endpoint별
+요청 수가 포함됩니다. 400 이상인 상태 코드를 오류 요청으로 집계하고, query string이
+다른 요청도 동일한 URL path로 합산합니다.
+
+빈 입력은 초기화된 빈 통계를 반환합니다. 잘못된 로그는 조용히 건너뛰지 않고 줄 번호와
+`ErrInvalidLogLine` 원인을 포함한 오류를 반환하며, Context가 취소되면 다음 줄의 분석을
+시작하지 않습니다. 현재 구현은 분석 코어만 포함하며 로컬 파일 입출력, Worker 연결 및
+S3 저장은 후속 작업에서 추가합니다.
 
 ### 단위 테스트
 
