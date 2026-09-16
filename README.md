@@ -20,6 +20,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] Job 상태 전이 Repository 및 Service
 - [x] Worker 작업 처리 오케스트레이션
 - [x] 웹 서버 로그 분석 코어
+- [x] 로컬 파일 기반 로그 Processor
 - [ ] 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -336,8 +337,46 @@ Apache Combined Log Format을 한 줄씩 분석합니다.
 
 빈 입력은 초기화된 빈 통계를 반환합니다. 잘못된 로그는 조용히 건너뛰지 않고 줄 번호와
 `ErrInvalidLogLine` 원인을 포함한 오류를 반환하며, Context가 취소되면 다음 줄의 분석을
-시작하지 않습니다. 현재 구현은 분석 코어만 포함하며 로컬 파일 입출력, Worker 연결 및
-S3 저장은 후속 작업에서 추가합니다.
+시작하지 않습니다. 분석 코어는 파일 저장소에 직접 의존하지 않으며 아래의 로컬
+Processor가 파일 입출력과 Worker 인터페이스 연결을 담당합니다.
+
+## 로컬 파일 기반 로그 Processor
+
+`internal/logprocessor`는 Worker의 `Processor` 인터페이스를 구현하며 로컬 Storage에서
+로그를 읽어 기존 `loganalysis.Analyzer`로 분석한 뒤 JSON 결과를 저장합니다.
+
+```text
+PROCESSING Job
+    ↓
+uploads/{job-id}/access.log 읽기
+    ↓
+웹 서버 로그 분석
+    ↓
+results/{job-id}.json 저장
+    ↓
+결과 키 반환
+```
+
+로컬 Storage root 아래의 디렉터리 구조는 다음과 같습니다.
+
+```text
+data/
+├── uploads/
+│   └── {job-id}/
+│       └── access.log
+└── results/
+    └── {job-id}.json
+```
+
+Storage key는 `/`를 사용하는 상대 경로만 허용합니다. 절대 경로, Windows 전용 경로,
+NUL 문자 및 `..`를 통해 root 밖으로 이동하는 경로는 `ErrInvalidInput`으로 거부합니다.
+결과는 대상 디렉터리의 임시 파일에 먼저 기록하고 `Sync`와 `Close`가 성공한 후 최종
+경로로 rename합니다. 실패하면 완성되지 않은 결과 파일을 남기지 않고 임시 파일을
+정리합니다.
+
+Processor는 Job 상태를 직접 변경하지 않습니다. Worker가 상태 전이를 담당하며,
+Processor는 성공 시 `results/{job-id}.json` 키만 반환합니다. 현재는 로컬 Storage만
+지원하고 S3 구현은 후속 작업에서 같은 Storage 인터페이스에 연결합니다.
 
 ### 단위 테스트
 
