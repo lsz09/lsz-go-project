@@ -23,6 +23,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] 로컬 파일 기반 로그 Processor
 - [x] 로컬 one-shot Worker 실행 프로그램
 - [x] Job 메시지 계약 및 메시지 큐 인터페이스
+- [x] LocalStack 기반 SQS Publisher 및 Consumer
 - [ ] 메시지 큐 기반 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -52,6 +53,23 @@ docker compose up -d postgres
 
 ```cmd
 docker compose ps
+```
+
+### LocalStack SQS 실행
+
+실제 AWS 계정과 비용 없이 SQS 연동을 개발할 수 있도록 LocalStack을 사용합니다.
+PostgreSQL과 LocalStack을 함께 실행합니다.
+
+```powershell
+docker compose up -d
+```
+
+LocalStack이 준비되면 `cloudqueue-jobs` Queue가 자동으로 생성됩니다. 서비스 상태와
+Queue 목록은 다음 명령으로 확인합니다.
+
+```powershell
+docker compose ps
+docker compose exec localstack awslocal sqs list-queues
 ```
 
 ### API 실행
@@ -469,9 +487,48 @@ Consumer.Delete   → 성공한 메시지만 삭제
 수신한 즉시 삭제하지 않고 Worker 처리가 성공한 뒤에만 삭제합니다. 처리에 실패하면
 삭제하지 않아 향후 큐의 재전달 정책을 적용할 수 있습니다.
 
-현재는 Message, Delivery, Publisher 및 Consumer 계약만 구현되어 있습니다. AWS SDK,
-LocalStack과 실제 SQS 연결, API 메시지 발행 및 Worker polling은 후속 작업에서
-추가합니다.
+Message, Delivery, Publisher 및 Consumer 계약을 기반으로 LocalStack SQS Adapter까지
+구현되어 있습니다. API 메시지 발행 및 Worker polling은 후속 작업에서 추가합니다.
+
+## LocalStack SQS Adapter
+
+`internal/jobqueue/sqsqueue`는 AWS SDK for Go v2를 사용해 기존 Publisher와 Consumer
+계약을 SQS로 구현합니다. 공통 `jobqueue` 패키지에는 AWS SDK 타입이 노출되지 않습니다.
+
+LocalStack 연결에는 다음 환경변수를 사용합니다.
+
+```dotenv
+AWS_REGION=ap-northeast-2
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
+SQS_ENDPOINT_URL=http://localhost:4566
+SQS_QUEUE_URL=http://localhost.localstack.cloud:4566/queue/ap-northeast-2/000000000000/cloudqueue-jobs
+SQS_WAIT_TIME_SECONDS=10
+```
+
+`SQS_WAIT_TIME_SECONDS`는 0초에서 20초까지 허용합니다. Publisher는 기존
+`jobqueue.Encode`로 생성한 JSON을 `SendMessage`로 발행하고, Consumer는 한 번에 최대
+한 개의 메시지를 long polling으로 받아 `jobqueue.Decode`로 검증합니다. 메시지가
+없으면 `jobqueue.ErrNoMessage`를 반환합니다.
+
+```text
+Publisher.Publish
+    ↓
+SQS SendMessage
+    ↓
+Consumer.Receive
+    ↓
+Worker 처리 성공
+    ↓
+Consumer.Delete
+```
+
+Consumer는 메시지를 수신할 때 자동으로 삭제하지 않습니다. 처리에 성공한 뒤 전달받은
+`ReceiptHandle`로 `Delete`를 호출해야 하며, 처리에 실패하면 삭제하지 않아 SQS가
+메시지를 다시 전달할 수 있게 합니다.
+
+현재 SQS Adapter는 API와 Worker 실행 프로그램에 자동으로 연결되어 있지 않습니다.
+Job 생성 API의 메시지 발행과 장기 실행 Worker polling은 후속 작업에서 구현합니다.
 
 ### 단위 테스트
 
@@ -509,6 +566,21 @@ Remove-Item Env:TEST_DATABASE_URL, Env:POSTGRES_PASSWORD
 ```
 
 `-race` 검사는 CGO와 C 컴파일러가 있는 환경에서 실행할 수 있습니다.
+
+### LocalStack SQS 통합 테스트
+
+LocalStack을 실행한 뒤 테스트 endpoint를 지정합니다. 통합 테스트는 실행마다 고유한
+Queue를 생성하고 자신이 만든 Queue만 정리합니다.
+
+```powershell
+$env:TEST_SQS_ENDPOINT_URL = "http://localhost:4566"
+$env:TEST_AWS_REGION = "ap-northeast-2"
+go test -tags=integration -v ./internal/jobqueue/...
+Remove-Item Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
+```
+
+테스트는 메시지 발행, 수신, 삭제, 잘못된 body 거부 및 long polling Context 취소를
+검증합니다.
 
 ## 종료
 

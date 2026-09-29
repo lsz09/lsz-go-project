@@ -1,6 +1,12 @@
 package jobqueue
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrNoMessage indicates that a queue receive operation completed without a message.
+var ErrNoMessage = errors.New("no job queue message")
 
 // Delivery contains a validated Message and the opaque token used to acknowledge it.
 type Delivery struct {

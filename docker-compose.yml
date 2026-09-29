@@ -26,5 +26,33 @@ services:
       retries: 10
       start_period: 10s
 
+  localstack:
+    image: localstack/localstack:4.8.1
+    container_name: cloudqueue-localstack
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
+
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-ap-northeast-2}
+      SQS_ENDPOINT_STRATEGY: path
+      SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-cloudqueue-jobs}
+
+    volumes:
+      - ./docker/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "awslocal sqs get-queue-url --queue-name $${SQS_QUEUE_NAME} >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
 volumes:
   postgres_data:
