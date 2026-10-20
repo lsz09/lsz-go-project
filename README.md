@@ -24,6 +24,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] 로컬 one-shot Worker 실행 프로그램
 - [x] Job 메시지 계약 및 메시지 큐 인터페이스
 - [x] LocalStack 기반 SQS Publisher 및 Consumer
+- [x] Job 생성 API SQS 메시지 발행 연동
 - [ ] 메시지 큐 기반 비동기 Worker
 - [ ] 메시지 큐
 - [ ] 파일 업로드
@@ -181,7 +182,8 @@ Content-Type: application/json
 }
 ```
 
-성공 시 `201 Created`와 생성된 `PENDING` 작업을 반환합니다.
+성공 시 PostgreSQL에 `PENDING` 작업을 저장하고, 생성된 Job ID를 SQS에 발행한 뒤
+`201 Created`와 작업 정보를 반환합니다.
 
 ```json
 {
@@ -196,6 +198,21 @@ Content-Type: application/json
 잘못된 JSON이나 입력에는 `400 Bad Request`, 지원하지 않는 Method에는
 `405 Method Not Allowed`, 내부 오류에는 상세를 숨긴 `500 Internal Server Error`를
 반환합니다.
+
+```text
+POST /api/v1/jobs
+    ↓
+PostgreSQL에 PENDING Job 저장
+    ↓
+{"job_id":"생성된 UUID"} 메시지를 SQS에 발행
+    ↓
+201 Created
+```
+
+Job 저장에 실패하면 메시지를 발행하지 않습니다. SQS 발행에 실패하면 내부 상세를 숨긴
+`500 Internal Server Error`를 반환합니다. 현재는 PostgreSQL 저장과 SQS 발행을 하나의
+트랜잭션으로 묶지 않으므로, 발행 실패 시 이미 생성된 `PENDING` Job이 남을 수 있습니다.
+이 일관성 보완은 Transactional Outbox 또는 복구 작업을 도입하는 후속 작업 범위입니다.
 
 ### 작업 목록 조회
 
@@ -488,7 +505,8 @@ Consumer.Delete   → 성공한 메시지만 삭제
 삭제하지 않아 향후 큐의 재전달 정책을 적용할 수 있습니다.
 
 Message, Delivery, Publisher 및 Consumer 계약을 기반으로 LocalStack SQS Adapter까지
-구현되어 있습니다. API 메시지 발행 및 Worker polling은 후속 작업에서 추가합니다.
+구현되어 있습니다. Job 생성 API는 Publisher를 사용해 메시지를 발행하며, Worker
+polling은 후속 작업에서 추가합니다.
 
 ## LocalStack SQS Adapter
 
@@ -527,8 +545,10 @@ Consumer는 메시지를 수신할 때 자동으로 삭제하지 않습니다. �
 `ReceiptHandle`로 `Delete`를 호출해야 하며, 처리에 실패하면 삭제하지 않아 SQS가
 메시지를 다시 전달할 수 있게 합니다.
 
-현재 SQS Adapter는 API와 Worker 실행 프로그램에 자동으로 연결되어 있지 않습니다.
-Job 생성 API의 메시지 발행과 장기 실행 Worker polling은 후속 작업에서 구현합니다.
+API 서버는 시작할 때 환경변수로 SQS Client와 Publisher를 구성합니다. Job 생성 흐름은
+Job Service와 Publisher를 조합하는 Submission Service를 거쳐 PostgreSQL 저장 후 SQS에
+메시지를 발행합니다. Worker 실행 프로그램의 장기 실행 polling은 후속 작업에서
+구현합니다.
 
 ### 단위 테스트
 
@@ -581,6 +601,22 @@ Remove-Item Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
 
 테스트는 메시지 발행, 수신, 삭제, 잘못된 body 거부 및 long polling Context 취소를
 검증합니다.
+
+### Job 생성 API·PostgreSQL·SQS 통합 테스트
+
+위의 테스트용 PostgreSQL과 LocalStack을 함께 실행한 상태에서 두 테스트 환경변수를
+모두 설정합니다. 테스트는 HTTP 요청으로 생성된 Job이 PostgreSQL에 `PENDING`으로
+저장되고 동일한 Job ID가 LocalStack SQS에서 수신되는지 검증합니다. 또한 발행 실패 시
+API가 내부 상세를 숨긴 `500`을 반환하고 저장된 `PENDING` Job이 남는 현재 동작을
+확인합니다.
+
+```powershell
+$env:TEST_DATABASE_URL = "postgres://cloudqueue_test:${testPassword}@localhost:55433/cloudqueue_test?sslmode=disable"
+$env:TEST_SQS_ENDPOINT_URL = "http://localhost:4566"
+$env:TEST_AWS_REGION = "ap-northeast-2"
+go test -tags=integration -v ./internal/jobsubmission
+Remove-Item Env:TEST_DATABASE_URL, Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
+```
 
 ## 종료
 
