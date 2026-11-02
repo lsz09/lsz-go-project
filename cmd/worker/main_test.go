@@ -19,23 +19,30 @@ func (f *fakeJobProcessor) ProcessJob(ctx context.Context, jobID string) error {
 }
 
 func TestLoadConfiguration(t *testing.T) {
-	validEnvironment := func(name string) string {
-		return map[string]string{
-			"DATABASE_URL":       "postgres://user:secret@localhost:5433/cloudqueue",
-			"LOCAL_STORAGE_ROOT": "./data",
-		}[name]
+	validValues := map[string]string{
+		"DATABASE_URL":          "postgres://user:secret@localhost:5433/cloudqueue",
+		"LOCAL_STORAGE_ROOT":    "./data",
+		"AWS_REGION":            "ap-northeast-2",
+		"AWS_ACCESS_KEY_ID":     "test-access-key",
+		"AWS_SECRET_ACCESS_KEY": "test-secret-key",
+		"SQS_ENDPOINT_URL":      "http://localhost:4566",
+		"SQS_QUEUE_URL":         "http://localhost:4566/000000000000/cloudqueue-jobs",
+		"SQS_WAIT_TIME_SECONDS": "10",
 	}
+	validEnvironment := func(name string) string { return validValues[name] }
 
 	tests := []struct {
-		name    string
-		args    []string
-		getenv  func(string) string
-		wantErr string
+		name      string
+		args      []string
+		getenv    func(string) string
+		wantErr   string
+		wantQueue bool
+		wantJobID string
 	}{
-		{name: "valid", args: []string{"-job-id", "00000000-0000-0000-0000-000000000001"}, getenv: validEnvironment},
-		{name: "missing job id", getenv: validEnvironment, wantErr: "-job-id is required"},
-		{name: "empty job id", args: []string{"-job-id", ""}, getenv: validEnvironment, wantErr: "-job-id is required"},
-		{name: "blank job id", args: []string{"-job-id", "   "}, getenv: validEnvironment, wantErr: "-job-id is required"},
+		{name: "one-shot mode", args: []string{"-job-id", "00000000-0000-0000-0000-000000000001"}, getenv: validEnvironment, wantJobID: "00000000-0000-0000-0000-000000000001"},
+		{name: "queue mode", getenv: validEnvironment, wantQueue: true},
+		{name: "empty job id", args: []string{"-job-id", ""}, getenv: validEnvironment, wantErr: "-job-id must not be empty"},
+		{name: "blank job id", args: []string{"-job-id", "   "}, getenv: validEnvironment, wantErr: "-job-id must not be empty"},
 		{name: "unknown option", args: []string{"-unknown"}, getenv: validEnvironment, wantErr: "parse CLI options"},
 		{name: "positional argument", args: []string{"-job-id", "00000000-0000-0000-0000-000000000001", "extra"}, getenv: validEnvironment, wantErr: "positional arguments are not allowed"},
 		{name: "missing database URL", args: []string{"-job-id", "00000000-0000-0000-0000-000000000001"}, getenv: func(string) string { return "" }, wantErr: "DATABASE_URL is required"},
@@ -57,6 +64,18 @@ func TestLoadConfiguration(t *testing.T) {
 			}
 			return "  "
 		}, wantErr: "LOCAL_STORAGE_ROOT is required"},
+		{name: "queue mode missing SQS configuration", getenv: func(name string) string {
+			if name == "DATABASE_URL" || name == "LOCAL_STORAGE_ROOT" {
+				return validValues[name]
+			}
+			return ""
+		}, wantErr: "queue mode"},
+		{name: "one-shot mode does not require SQS configuration", args: []string{"-job-id", "job-id"}, getenv: func(name string) string {
+			if name == "DATABASE_URL" || name == "LOCAL_STORAGE_ROOT" {
+				return validValues[name]
+			}
+			return ""
+		}, wantJobID: "job-id"},
 		{name: "nil environment lookup", args: []string{"-job-id", "00000000-0000-0000-0000-000000000001"}, wantErr: "environment lookup is required"},
 	}
 
@@ -75,8 +94,14 @@ func TestLoadConfiguration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load configuration: %v", err)
 			}
-			if config.jobID != test.args[1] || config.databaseURL != validEnvironment("DATABASE_URL") || config.localStorageRoot != validEnvironment("LOCAL_STORAGE_ROOT") {
+			if config.jobID != test.wantJobID || config.databaseURL != validEnvironment("DATABASE_URL") || config.localStorageRoot != validEnvironment("LOCAL_STORAGE_ROOT") {
 				t.Fatalf("unexpected configuration: %+v", config)
+			}
+			if (config.sqs != nil) != test.wantQueue {
+				t.Fatalf("queue mode = %t, want %t", config.sqs != nil, test.wantQueue)
+			}
+			if config.sqs != nil && (config.sqs.QueueURL != validValues["SQS_QUEUE_URL"] || config.sqs.WaitTimeSeconds != 10) {
+				t.Fatalf("unexpected queue configuration")
 			}
 		})
 	}
