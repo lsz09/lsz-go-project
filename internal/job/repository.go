@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -16,6 +17,8 @@ var (
 	ErrNotFound          = errors.New("job not found")
 	ErrInvalidInput      = errors.New("invalid job input")
 	ErrInvalidTransition = errors.New("invalid job status transition")
+	// ErrNotCreated guarantees that the failed create did not persist a Job.
+	ErrNotCreated = errors.New("job was not created")
 )
 
 const (
@@ -51,6 +54,11 @@ func (r *Repository) Create(ctx context.Context, params CreateParams) (Job, erro
 		"INSERT INTO jobs (file_name, file_key) VALUES ($1, $2) RETURNING "+jobColumns,
 		params.FileName, params.FileKey))
 	if err != nil {
+		var pgError *pgconn.PgError
+		if pgconn.SafeToRetry(err) || (errors.As(err, &pgError) &&
+			(strings.HasPrefix(pgError.Code, "22") || strings.HasPrefix(pgError.Code, "23") || strings.HasPrefix(pgError.Code, "42"))) {
+			err = errors.Join(ErrNotCreated, err)
+		}
 		return Job{}, fmt.Errorf("create job: %w", err)
 	}
 	return result, nil

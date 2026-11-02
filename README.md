@@ -27,7 +27,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] Job 생성 API SQS 메시지 발행 연동
 - [x] 메시지 큐 기반 비동기 Worker
 - [x] 메시지 큐
-- [ ] 파일 업로드
+- [x] 로컬 로그 파일 업로드 및 Job 생성
 - [ ] AWS 배포
 - [ ] Observability
 
@@ -557,6 +557,76 @@ API 서버는 시작할 때 환경변수로 SQS Client와 Publisher를 구성합
 Job Service와 Publisher를 조합하는 Submission Service를 거쳐 PostgreSQL 저장 후 SQS에
 메시지를 발행합니다. Worker도 같은 환경변수로 SQS Client와 Consumer를 구성하며,
 메시지 body나 `ReceiptHandle`, 자격 증명은 로그에 기록하지 않습니다.
+
+## 로그 파일 업로드
+
+`POST /api/v1/jobs`는 기존 JSON 요청과 함께 `multipart/form-data` 파일 업로드를
+지원합니다. API와 Worker에 동일한 `LOCAL_STORAGE_ROOT`를 설정해야 합니다.
+API 시작 시에도 이 환경변수가 필수입니다.
+
+PostgreSQL과 LocalStack을 실행하고 Migration을 적용한 뒤 API와 Worker를 각각 실행합니다.
+
+```powershell
+go run ./cmd/api
+```
+
+다른 터미널에서 Worker를 시작합니다.
+
+```powershell
+go run ./cmd/worker
+```
+
+로그 파일을 업로드합니다. multipart boundary는 curl이 생성하므로 Content-Type을
+수동으로 지정하지 않습니다.
+
+```powershell
+curl.exe -X POST http://localhost:8080/api/v1/jobs -F "file=@access.log"
+```
+
+파일은 `uploads/{upload-id}/access.log`에 저장되며, 원본 파일명은 Job의 `file_name`에
+기록합니다. upload-id는 Job ID와 별도로 서버가 생성한 UUID입니다. 응답은 기존 생성
+API와 동일한 `201 Created` JSON이며 `id`, `status`, `file_name`, `file_key`, `created_at`을
+포함합니다. 응답의 `id`로 `GET /api/v1/jobs/{id}`를 호출해 진행 상태를 확인할 수 있습니다.
+Worker는 비동기로 처리하므로 조회 시 이미 상태가 변경되었을 수 있습니다.
+
+파일은 `file` 필드 한 개만 허용하고 최대 크기는 **10 MiB**입니다. 전체 multipart 요청은
+**11 MiB**로 제한합니다. Content-Length가 없는 요청에도 실제 읽은 크기로 제한을
+적용합니다. 파일 데이터는 최대 64 KiB만 메모리에 유지하고 나머지는 임시 파일로
+처리하며 요청 종료 시 정리합니다. 로그 내용의 형식 검사는 Worker에서 수행하므로
+잘못된 로그도 업로드는 성공한 뒤 Job이 `FAILED`가 될 수 있습니다.
+
+| 상황 | 응답 |
+| --- | --- |
+| 파일 누락·빈 파일·여러 파일·추가 필드·위험한 파일명·잘못된 multipart | `400 Bad Request` |
+| 파일 또는 전체 요청 크기 제한 초과 | `413 Request Entity Too Large` |
+| 지원하지 않는 Content-Type | `415 Unsupported Media Type` |
+| Storage·DB·SQS 처리 실패 | `500 Internal Server Error` |
+
+절대경로, 경로 구분자, `..`, 제어문자가 있는 원본 파일명은 거부하며, 원본 이름을
+저장 경로로 사용하지 않습니다. 원본 파일명은 UTF-8 기준 255바이트까지 허용합니다.
+기존 JSON 클라이언트의 호환성을 위해 Content-Type을 생략한 요청은 JSON으로 처리합니다.
+
+파일 저장 실패와 Job 생성 전 취소는 해당 파일을 정리합니다. DB가 Job을 생성하지
+않았음을 확실히 알 수 있는 오류도 입력 파일을 정리합니다. DB 저장 여부가 불확실하거나
+Job 생성 후 SQS 발행이 실패하면 파일과 Job을 보존합니다. 이때 HTTP 오류 뒤 재요청하면
+중복 Job이 생길 수 있으며, Outbox·고아 파일 복구·요청 멱등성은 아직 지원하지 않습니다.
+성공한 Job의 입력 파일은 자동 삭제하지 않습니다. 파일 정리 시 빈 상위 디렉터리는 유지합니다.
+
+업로드 단위 테스트는 다음과 같이 실행합니다.
+
+```powershell
+go test ./internal/jobupload ./internal/job ./internal/logprocessor
+```
+
+PostgreSQL과 LocalStack 테스트 환경변수 설정 후 전체 업로드 통합 흐름을 실행합니다.
+
+```powershell
+go test -tags=integration -v ./cmd/worker -run TestUploadedJobIntegration
+```
+
+업로드 → 입력 파일·Job 저장 → SQS 수신 → Worker 분석 → 결과 JSON 생성·성공 메시지 삭제와
+잘못된 로그의 FAILED 전이, 발행 실패 시 입력 파일 보존을 검증합니다. 아래의 통합 테스트
+절을 참고해 전용 테스트 DB 및 LocalStack 환경변수를 설정합니다.
 
 ### 단위 테스트
 
