@@ -72,6 +72,32 @@ func TestLocalStoragePutWritesAtomically(t *testing.T) {
 	assertNoTemporaryFiles(t, filepath.Join(root, "results"))
 }
 
+func TestLocalStorageDelete(t *testing.T) {
+	root := t.TempDir()
+	storage := NewLocalStorage(root)
+	ctx := context.Background()
+	if err := storage.Put(ctx, "uploads/test/access.log", strings.NewReader("input")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Delete(ctx, "uploads/test/access.log"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "uploads", "test", "access.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("object not removed: %v", err)
+	}
+	if err := storage.Delete(ctx, "uploads/test/access.log"); err != nil {
+		t.Fatalf("missing object delete: %v", err)
+	}
+	if err := storage.Delete(ctx, "../outside"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("unsafe delete allowed: %v", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := storage.Delete(canceled, "uploads/test/access.log"); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
 // TestLocalStorageRejectsUnsafeKeys verifies portable path traversal protection.
 func TestLocalStorageRejectsUnsafeKeys(t *testing.T) {
 	storage := NewLocalStorage(t.TempDir())

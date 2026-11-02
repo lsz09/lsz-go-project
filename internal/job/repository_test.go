@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -27,6 +28,24 @@ func (f fakeDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, e
 }
 
 type errorRow struct{ err error }
+
+func TestCreateDistinguishesDefiniteRejectionFromAmbiguousFailure(t *testing.T) {
+	for _, tc := range []struct {
+		code       string
+		notCreated bool
+	}{
+		{"23514", true}, {"22001", true}, {"42P01", true}, {"40003", false}, {"08007", false}, {"57014", false},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			cause := &pgconn.PgError{Code: tc.code}
+			repo := &Repository{db: fakeDB{queryRow: func(context.Context, string, ...any) pgx.Row { return errorRow{cause} }}}
+			_, err := repo.Create(context.Background(), CreateParams{FileName: "access.log"})
+			if !errors.Is(err, cause) || errors.Is(err, ErrNotCreated) != tc.notCreated {
+				t.Fatalf("incorrect persistence classification: %v", err)
+			}
+		})
+	}
+}
 
 func (r errorRow) Scan(...any) error { return r.err }
 

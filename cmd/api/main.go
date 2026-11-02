@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -15,6 +16,8 @@ import (
 	"cloudqueue/internal/job"
 	"cloudqueue/internal/jobqueue/sqsqueue"
 	"cloudqueue/internal/jobsubmission"
+	"cloudqueue/internal/jobupload"
+	"cloudqueue/internal/logprocessor"
 )
 
 func main() {
@@ -28,6 +31,11 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
+	}
+	storageRoot := os.Getenv("LOCAL_STORAGE_ROOT")
+	if strings.TrimSpace(storageRoot) == "" {
+		slog.Error("LOCAL_STORAGE_ROOT environment variable is required")
+		os.Exit(1)
 	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -79,7 +87,8 @@ func main() {
 	jobRepository := job.NewRepository(pool)
 	jobService := job.NewService(jobRepository)
 	jobSubmissionService := jobsubmission.NewService(jobService, sqsPublisher)
-	jobHandler := job.NewHandler(jobSubmissionService)
+	jobUploadService := jobupload.NewService(logprocessor.NewLocalStorage(storageRoot), jobSubmissionService)
+	jobHandler := job.NewHandlerWithUploader(jobSubmissionService, jobUploadService)
 
 	server := &http.Server{
 		Addr:              ":" + port,

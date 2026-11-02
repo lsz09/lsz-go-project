@@ -10,6 +10,9 @@ import (
 	"cloudqueue/internal/jobqueue"
 )
 
+// ErrJobCreated marks errors occurring after a Job was durably created.
+var ErrJobCreated = errors.New("job already created")
+
 // JobService is the Job application surface used by the HTTP Handler.
 type JobService interface {
 	Create(ctx context.Context, params job.CreateParams) (job.Job, error)
@@ -44,12 +47,12 @@ func (s *Service) Create(ctx context.Context, params job.CreateParams) (job.Job,
 
 	message, err := jobqueue.NewMessage(created.ID)
 	if err != nil {
-		return job.Job{}, fmt.Errorf("submit job: create message: %w", err)
+		return job.Job{}, fmt.Errorf("submit job: create message: %w", errors.Join(ErrJobCreated, err))
 	}
 	if err := s.publisher.Publish(ctx, message); err != nil {
 		// The PENDING Job intentionally remains durable. A later outbox/recovery task
 		// will close the consistency gap between PostgreSQL and SQS.
-		return job.Job{}, fmt.Errorf("submit job: publish: %w", err)
+		return job.Job{}, fmt.Errorf("submit job: publish: %w", errors.Join(ErrJobCreated, err))
 	}
 
 	return created, nil

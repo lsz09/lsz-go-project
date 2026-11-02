@@ -24,6 +24,25 @@ func NewLocalStorage(root string) *LocalStorage {
 	return &LocalStorage{root: root}
 }
 
+// Delete removes one object; a missing object is already clean. Parent directories
+// are left in place to avoid removing anything owned by another request.
+func (s *LocalStorage) Delete(ctx context.Context, key string) error {
+	if s == nil || strings.TrimSpace(s.root) == "" || isNil(ctx) {
+		return fmt.Errorf("local storage: invalid delete input: %w", ErrInvalidInput)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	filePath, err := s.resolve(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return newStorageError("delete input", key, err)
+	}
+	return nil
+}
+
 // Open opens a validated local object for reading.
 func (s *LocalStorage) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 	if s == nil || strings.TrimSpace(s.root) == "" {

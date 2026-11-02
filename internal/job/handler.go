@@ -30,7 +30,13 @@ type JobService interface {
 
 // Handler는 Job HTTP 요청을 Service 호출과 JSON 응답으로 변환합니다.
 type Handler struct {
-	service JobService
+	service  JobService
+	uploader UploadService
+}
+
+// UploadService stores an input file and submits the corresponding Job.
+type UploadService interface {
+	Upload(context.Context, string, io.Reader) (Job, error)
 }
 
 // createJobRequest는 작업 생성 API에서 허용하는 JSON 필드입니다.
@@ -79,6 +85,11 @@ func NewHandler(service JobService) *Handler {
 	return &Handler{service: service}
 }
 
+// NewHandlerWithUploader enables multipart creation alongside the JSON API.
+func NewHandlerWithUploader(service JobService, uploader UploadService) *Handler {
+	return &Handler{service: service, uploader: uploader}
+}
+
 // ServeHTTP는 컬렉션과 단건 경로를 구분해 Job 요청을 처리합니다.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 정확한 컬렉션 경로와 ID가 뒤따르는 단건 경로만 허용합니다.
@@ -125,6 +136,9 @@ func (h *Handler) serveItem(w http.ResponseWriter, r *http.Request) {
 
 // createJob은 JSON 요청을 검증하고 새 PENDING 작업을 생성합니다.
 func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
+	if h.dispatchUpload(w, r) {
+		return
+	}
 	// JSON 구조, 알 수 없는 필드, Body 크기와 단일 객체 여부를 검증합니다.
 	request, err := decodeCreateJobRequest(w, r)
 	if err != nil {
