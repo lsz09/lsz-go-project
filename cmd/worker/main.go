@@ -19,6 +19,7 @@ import (
 
 	"cloudqueue/internal/database"
 	"cloudqueue/internal/job"
+	"cloudqueue/internal/jobqueue/sqsqueue"
 	"cloudqueue/internal/loganalysis"
 	"cloudqueue/internal/logprocessor"
 	workerpkg "cloudqueue/internal/worker"
@@ -31,6 +32,7 @@ type configuration struct {
 	jobID            string
 	databaseURL      string
 	localStorageRoot string
+	sqs              *sqsqueue.Config
 }
 
 // JobProcessor is the smallest Worker behavior required by the command.
@@ -72,11 +74,19 @@ func command(args []string, getenv func(string) string) int {
 	defer stop()
 
 	if err := execute(ctx, config); err != nil {
-		slog.Error("worker job processing failed", "job_id", config.jobID, "error", err)
+		if config.sqs == nil {
+			slog.Error("worker job processing failed", "job_id", config.jobID, "error", err)
+		} else {
+			slog.Error("queue worker stopped with an error", "error", err)
+		}
 		return 1
 	}
 
-	slog.Info("worker job processing completed", "job_id", config.jobID)
+	if config.sqs == nil {
+		slog.Info("worker job processing completed", "job_id", config.jobID)
+	} else {
+		slog.Info("queue worker stopped")
+	}
 	return 0
 }
 
@@ -95,8 +105,14 @@ func loadConfiguration(args []string, getenv func(string) string) (configuration
 	if flags.NArg() != 0 {
 		return configuration{}, errors.New("load configuration: positional arguments are not allowed")
 	}
-	if strings.TrimSpace(*jobID) == "" {
-		return configuration{}, errors.New("load configuration: -job-id is required")
+	jobIDProvided := false
+	flags.Visit(func(current *flag.Flag) {
+		if current.Name == "job-id" {
+			jobIDProvided = true
+		}
+	})
+	if jobIDProvided && strings.TrimSpace(*jobID) == "" {
+		return configuration{}, errors.New("load configuration: -job-id must not be empty when provided")
 	}
 
 	databaseURL := getenv("DATABASE_URL")
@@ -108,14 +124,22 @@ func loadConfiguration(args []string, getenv func(string) string) (configuration
 		return configuration{}, errors.New("load configuration: LOCAL_STORAGE_ROOT is required")
 	}
 
-	return configuration{
+	config := configuration{
 		jobID:            *jobID,
 		databaseURL:      databaseURL,
 		localStorageRoot: localStorageRoot,
-	}, nil
+	}
+	if !jobIDProvided {
+		sqsConfig, err := sqsqueue.ConfigFromEnvironment(getenv)
+		if err != nil {
+			return configuration{}, fmt.Errorf("load configuration: queue mode: %w", err)
+		}
+		config.sqs = &sqsConfig
+	}
+	return config, nil
 }
 
-// execute connects to PostgreSQL, assembles the Worker dependencies, and processes one job.
+// execute connects to PostgreSQL and runs either one Job or the long-running queue Worker.
 func execute(ctx context.Context, config configuration) error {
 	if ctx == nil {
 		return errors.New("run worker: context is required")
@@ -134,6 +158,25 @@ func execute(ctx context.Context, config configuration) error {
 
 	slog.Info("connected to PostgreSQL")
 	processor := newJobProcessor(pool, config.localStorageRoot)
+	if config.sqs != nil {
+		startupContext, cancel = context.WithTimeout(ctx, startupTimeout)
+		client, clientErr := sqsqueue.NewClient(startupContext, *config.sqs)
+		cancel()
+		if clientErr != nil {
+			return &safeOperationError{operation: "run worker: create SQS client", cause: clientErr}
+		}
+		consumer, consumerErr := sqsqueue.NewConsumer(client, config.sqs.QueueURL, config.sqs.WaitTimeSeconds)
+		if consumerErr != nil {
+			return &safeOperationError{operation: "run worker: create SQS consumer", cause: consumerErr}
+		}
+
+		slog.Info("queue worker started")
+		if err := workerpkg.NewQueueRunner(consumer, processor, slog.Default()).Run(ctx); err != nil {
+			return err
+		}
+		return nil
+	}
+
 	slog.Info("worker job processing started", "job_id", config.jobID)
 	if err := run(ctx, processor, config.jobID); err != nil {
 		return err

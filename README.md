@@ -25,8 +25,8 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] Job 메시지 계약 및 메시지 큐 인터페이스
 - [x] LocalStack 기반 SQS Publisher 및 Consumer
 - [x] Job 생성 API SQS 메시지 발행 연동
-- [ ] 메시지 큐 기반 비동기 Worker
-- [ ] 메시지 큐
+- [x] 메시지 큐 기반 비동기 Worker
+- [x] 메시지 큐
 - [ ] 파일 업로드
 - [ ] AWS 배포
 - [ ] Observability
@@ -356,8 +356,8 @@ MarkProcessing → Processor.Process → MarkCompleted
   반환합니다. 실패 상태 저장도 함께 실패하면 `errors.Join`으로 두 오류를 모두 보존합니다.
 - 호출자의 Context는 모든 단계에 동일하게 전달되며, Processor 실행 전에 취소되면
   처리를 시작하지 않습니다.
-- 현재 로컬 실행 프로그램은 Job ID 하나를 처리하고 종료하는 one-shot 방식입니다.
-  SQS 연동과 재시도는 이후 작업에서 추가합니다.
+- `QueueRunner`는 SQS 메시지를 반복 수신하고 처리 성공 후에만 삭제합니다. 처리 실패
+  메시지는 삭제하지 않고 다음 메시지 polling을 계속합니다.
 
 ## 웹 서버 로그 분석
 
@@ -418,8 +418,9 @@ Processor는 성공 시 `results/{job-id}.json` 키만 반환합니다. 현재�
 ## 로컬 Worker 실행
 
 API 서버와 Worker는 각각 `cmd/api`, `cmd/worker`의 독립 프로세스로 실행합니다.
-Worker는 현재 메시지 큐 대신 `-job-id`로 전달받은 작업 하나만 처리하고 종료합니다.
-정상 처리 시 종료 코드 `0`, 설정·DB 연결·작업 처리 실패 시 non-zero를 반환합니다.
+Worker는 `-job-id`를 전달하면 작업 하나만 처리하고 종료하며, 옵션을 생략하면 SQS를
+long polling하는 장기 실행 모드로 동작합니다. 단건 처리 성공 시 종료 코드 `0`,
+설정·DB 연결·작업 처리 실패 시 non-zero를 반환합니다.
 
 `.env`에는 PostgreSQL 접속 정보와 로컬 Storage root를 설정합니다. 실제 비밀번호는
 `.env.example`이 아니라 Git에서 제외된 `.env`에만 저장합니다.
@@ -466,12 +467,19 @@ Content-Type: application/json
 go run ./cmd/worker -job-id {job-id}
 ```
 
+SQS에 발행된 작업을 계속 처리하려면 `-job-id` 없이 실행합니다. 이 모드에는 아래
+LocalStack SQS Adapter 절의 AWS 및 SQS 환경변수가 모두 필요합니다.
+
+```powershell
+go run ./cmd/worker
+```
+
 정상 처리 후 작업은 `COMPLETED`, `result_key`는 `results/{job-id}.json`이 되며
 같은 위치에 분석 결과 JSON 파일이 생성됩니다. 입력 파일이 없거나 로그 형식이
 잘못되면 작업은 `FAILED`가 되고 `error_message`에 실패 원인이 저장됩니다.
-`Ctrl+C` 또는 `SIGTERM`을 받으면 실행 중인 작업 Context를 취소합니다.
-
-SQS에서 Job ID를 수신하는 지속 실행 방식은 후속 작업에서 추가합니다.
+큐 모드는 처리 성공 메시지만 삭제하고, 처리 실패 메시지는 삭제하지 않아 visibility
+timeout 이후 다시 전달될 수 있게 합니다. 빈 polling 결과는 정상 상태로 간주합니다.
+`Ctrl+C` 또는 `SIGTERM`을 받으면 실행 중인 수신·작업 Context를 취소하고 정상 종료합니다.
 
 ## Job 메시지 및 Queue 계약
 
@@ -505,8 +513,8 @@ Consumer.Delete   → 성공한 메시지만 삭제
 삭제하지 않아 향후 큐의 재전달 정책을 적용할 수 있습니다.
 
 Message, Delivery, Publisher 및 Consumer 계약을 기반으로 LocalStack SQS Adapter까지
-구현되어 있습니다. Job 생성 API는 Publisher를 사용해 메시지를 발행하며, Worker
-polling은 후속 작업에서 추가합니다.
+구현되어 있습니다. Job 생성 API는 Publisher를 사용해 메시지를 발행하며, Worker의
+`QueueRunner`가 Consumer를 통해 지속적으로 수신합니다.
 
 ## LocalStack SQS Adapter
 
@@ -547,8 +555,8 @@ Consumer는 메시지를 수신할 때 자동으로 삭제하지 않습니다. �
 
 API 서버는 시작할 때 환경변수로 SQS Client와 Publisher를 구성합니다. Job 생성 흐름은
 Job Service와 Publisher를 조합하는 Submission Service를 거쳐 PostgreSQL 저장 후 SQS에
-메시지를 발행합니다. Worker 실행 프로그램의 장기 실행 polling은 후속 작업에서
-구현합니다.
+메시지를 발행합니다. Worker도 같은 환경변수로 SQS Client와 Consumer를 구성하며,
+메시지 body나 `ReceiptHandle`, 자격 증명은 로그에 기록하지 않습니다.
 
 ### 단위 테스트
 
@@ -580,7 +588,8 @@ docker exec cloudqueue-job-test pg_isready -U cloudqueue_test -d cloudqueue_test
 ```powershell
 $testPassword = [uri]::EscapeDataString($env:POSTGRES_PASSWORD)
 $env:TEST_DATABASE_URL = "postgres://cloudqueue_test:${testPassword}@localhost:55433/cloudqueue_test?sslmode=disable"
-go test -tags=integration -v ./internal/job ./cmd/worker
+go test -tags=integration -v ./internal/job
+go test -tags=integration -v ./cmd/worker -run TestLocalWorkerIntegration
 docker stop cloudqueue-job-test
 Remove-Item Env:TEST_DATABASE_URL, Env:POSTGRES_PASSWORD
 ```
@@ -602,19 +611,20 @@ Remove-Item Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
 테스트는 메시지 발행, 수신, 삭제, 잘못된 body 거부 및 long polling Context 취소를
 검증합니다.
 
-### Job 생성 API·PostgreSQL·SQS 통합 테스트
+### Job 생성 API·큐 Worker·PostgreSQL·SQS 통합 테스트
 
 위의 테스트용 PostgreSQL과 LocalStack을 함께 실행한 상태에서 두 테스트 환경변수를
 모두 설정합니다. 테스트는 HTTP 요청으로 생성된 Job이 PostgreSQL에 `PENDING`으로
-저장되고 동일한 Job ID가 LocalStack SQS에서 수신되는지 검증합니다. 또한 발행 실패 시
-API가 내부 상세를 숨긴 `500`을 반환하고 저장된 `PENDING` Job이 남는 현재 동작을
-확인합니다.
+저장되고 동일한 Job ID가 LocalStack SQS에서 수신되는지 검증합니다. 큐 Worker 테스트는
+성공한 Job이 `COMPLETED`로 바뀌고 메시지가 삭제되는지, 실패한 Job이 `FAILED`로 바뀌고
+메시지는 재전달을 위해 남는지도 확인합니다. 또한 발행 실패 시 API가 내부 상세를 숨긴
+`500`을 반환하고 저장된 `PENDING` Job이 남는 현재 동작을 확인합니다.
 
 ```powershell
 $env:TEST_DATABASE_URL = "postgres://cloudqueue_test:${testPassword}@localhost:55433/cloudqueue_test?sslmode=disable"
 $env:TEST_SQS_ENDPOINT_URL = "http://localhost:4566"
 $env:TEST_AWS_REGION = "ap-northeast-2"
-go test -tags=integration -v ./internal/jobsubmission
+go test -tags=integration -v ./internal/jobsubmission ./cmd/worker
 Remove-Item Env:TEST_DATABASE_URL, Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
 ```
 
