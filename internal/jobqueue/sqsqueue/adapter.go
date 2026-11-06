@@ -14,7 +14,7 @@ import (
 	"cloudqueue/internal/jobqueue"
 )
 
-var ErrInvalidDelivery = errors.New("invalid SQS delivery")
+var ErrInvalidDelivery = jobqueue.ErrInvalidDelivery
 
 // SendMessageAPI is the minimal AWS SDK surface required by Publisher.
 type SendMessageAPI interface {
@@ -146,7 +146,7 @@ func (c *Consumer) Delete(ctx context.Context, receiptHandle string) error {
 func decodeDelivery(message types.Message) (jobqueue.Delivery, error) {
 	decoded, err := jobqueue.Decode([]byte(aws.ToString(message.Body)))
 	if err != nil {
-		return jobqueue.Delivery{}, fmt.Errorf("decode SQS message: %w", err)
+		return jobqueue.Delivery{}, operationError("decode SQS message", errors.Join(jobqueue.ErrInvalidDelivery, err))
 	}
 	receiptHandle := aws.ToString(message.ReceiptHandle)
 	if strings.TrimSpace(receiptHandle) == "" {

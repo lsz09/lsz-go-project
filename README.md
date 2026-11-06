@@ -558,6 +558,91 @@ Job Service와 Publisher를 조합하는 Submission Service를 거쳐 PostgreSQL
 메시지를 발행합니다. Worker도 같은 환경변수로 SQS Client와 Consumer를 구성하며,
 메시지 body나 `ReceiptHandle`, 자격 증명은 로그에 기록하지 않습니다.
 
+## SQS 재전달 제한 및 DLQ
+
+LocalStack 초기화 스크립트는 원본 `cloudqueue-jobs`와 실패 메시지 보관용
+`cloudqueue-jobs-dlq`를 구성합니다. 기본 설정은 다음과 같습니다.
+
+```dotenv
+SQS_QUEUE_NAME=cloudqueue-jobs
+SQS_DLQ_NAME=cloudqueue-jobs-dlq
+SQS_MAX_RECEIVE_COUNT=5
+```
+
+원본 Queue의 Visibility Timeout은 30초, DLQ의 메시지 보존 기간은 14일입니다.
+수신 후 삭제되지 않은 메시지는 Visibility Timeout 이후 다시 전달될 수 있고,
+Redrive Policy의 최대 수신 횟수를 초과하면 SQS가 DLQ로 이동합니다. 이는 Job의
+실행 횟수가 아니라 메시지의 수신 횟수 기준입니다. 콘솔이나 CLI의 수신도 횟수에
+영향을 주므로 운영 Queue 메시지를 확인할 때 주의해야 합니다.
+
+`SQS_MAX_RECEIVE_COUNT`는 1~1000의 정수로 설정하며 선행 0은 허용하지 않습니다.
+Queue 이름은 80자 이하의 영문·숫자·하이픈·밑줄을 허용하며, 원본과 DLQ 이름은
+달라야 합니다. 명시적으로 빈 DLQ 이름이나 수신 횟수를 전달하면 초기화에 실패합니다.
+
+초기화는 기존 Queue를 조회하고 속성만 갱신하므로 Queue와 기존 메시지를 삭제하지
+않습니다. `.env`의 값을 변경했다면 LocalStack 컨테이너를 재구성하고 초기화 스크립트를
+재실행합니다. 이 스크립트는 LocalStack 개발용이며 실제 AWS 리소스는 변경하지 않습니다.
+
+```powershell
+docker compose up -d localstack
+docker compose exec localstack sh /etc/localstack/init/ready.d/init-aws.sh
+docker compose exec localstack awslocal sqs list-queues
+```
+
+### Worker 메시지 정책
+
+| 상태 또는 오류 | 동작 |
+| --- | --- |
+| PENDING | 원자적 상태 전이로 획득 후 처리, 성공하면 메시지 삭제 |
+| COMPLETED | DB 상태를 확인하고 재분석 없이 중복 메시지 삭제 |
+| FAILED·PROCESSING·미존재 Job | 메시지 미삭제, 다음 polling 계속 |
+| DB 조회·상태 전이 오류 | 메시지 미삭제, 다음 polling 계속 |
+| 잘못된 JSON·Job ID·알 수 없는 필드·ReceiptHandle 누락 | 메시지 미삭제, 안전한 경고 후 다음 polling 계속 |
+| SQS 수신·삭제 요청 오류 | 안전한 오류를 반환하고 Worker 종료 |
+| Context 취소 | 추가 수신·삭제 없이 정상 종료 |
+
+`QueueProcessor`는 큐 실행에만 적용됩니다. 기존 `-job-id` 단건 실행의 상태 전이
+검증은 유지됩니다. 동시 Worker의 상태 획득 충돌은 성공으로 간주하지 않습니다.
+메시지 본문과 ReceiptHandle은 로그에 기록하지 않습니다.
+
+FAILED는 최종 상태이므로 메시지가 재전달되어도 Job을 재실행하지 않습니다.
+DLQ 자동 복원, 실패 Job 자동 재실행, 고아 PROCESSING 복구 및 Visibility Timeout
+자동 연장은 아직 지원하지 않습니다.
+
+### Queue 설정 및 DLQ 확인
+
+다음 예시는 기본 Queue 이름을 사용합니다. 이름을 바꿨다면 함께 수정합니다.
+
+```powershell
+$sourceQueueUrl = docker compose exec -T localstack awslocal sqs get-queue-url --queue-name cloudqueue-jobs --query QueueUrl --output text
+docker compose exec -T localstack awslocal sqs get-queue-attributes --queue-url $sourceQueueUrl --attribute-names RedrivePolicy VisibilityTimeout
+$deadLetterQueueUrl = docker compose exec -T localstack awslocal sqs get-queue-url --queue-name cloudqueue-jobs-dlq --query QueueUrl --output text
+docker compose exec -T localstack awslocal sqs get-queue-attributes --queue-url $deadLetterQueueUrl --attribute-names ApproximateNumberOfMessages MessageRetentionPeriod
+docker compose exec -T localstack awslocal sqs receive-message --queue-url $deadLetterQueueUrl --max-number-of-messages 1 --wait-time-seconds 1
+```
+
+마지막 명령은 DLQ 메시지를 실제로 수신하며 visibility에 영향을 줍니다. 자동으로
+삭제하거나 원본 Queue로 복원하지는 않습니다.
+
+### 테스트
+
+```powershell
+go test ./internal/worker ./internal/jobqueue/...
+```
+
+전용 PostgreSQL과 LocalStack을 실행하고 아래 통합 테스트 절의 환경변수를 설정합니다.
+테스트는 고유한 원본 Queue와 DLQ, 1초 Visibility Timeout, 최대 수신 횟수 2를 사용합니다.
+
+```powershell
+go test -tags=integration -v ./cmd/worker -run TestQueueWorkerRedriveIntegration
+```
+
+잘못된 메시지와 FAILED Job 메시지의 DLQ 이동, 정상 Job 처리 지속, 완료된 Job의
+중복 메시지 삭제 및 결과 파일 불변을 검증합니다. CI는 전체 integration race 검사와
+초기화 스크립트의 재실행·설정 갱신·기존 메시지 보존·잘못된 설정 거부도 확인합니다.
+
+정책 참고: [AWS SQS DLQ 문서](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+
 ## 로그 파일 업로드
 
 `POST /api/v1/jobs`는 기존 JSON 요청과 함께 `multipart/form-data` 파일 업로드를

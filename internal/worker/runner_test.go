@@ -271,6 +271,48 @@ func fmtNoMessage() error {
 	return errors.Join(errors.New("poll completed"), jobqueue.ErrNoMessage)
 }
 
+func TestQueueRunnerSkipsInvalidDeliveryAndProcessesNext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs bytes.Buffer
+	calls, processed, deleted := 0, 0, 0
+	consumer := &runnerConsumer{
+		receive: func(context.Context) (jobqueue.Delivery, error) {
+			calls++
+			if calls == 1 {
+				return jobqueue.Delivery{}, errors.Join(jobqueue.ErrInvalidDelivery, errors.New("body-secret receipt-secret"))
+			}
+			if calls == 2 {
+				return jobqueue.Delivery{Message: jobqueue.Message{JobID: "unvalidated-secret"}, ReceiptHandle: "receipt-secret"}, nil
+			}
+			return jobqueue.Delivery{Message: jobqueue.Message{JobID: runnerTestJobID}, ReceiptHandle: "valid-receipt"}, nil
+		},
+		delete: func(context.Context, string) error { deleted++; cancel(); return nil },
+	}
+	processor := &runnerProcessor{process: func(context.Context, string) error { processed++; return nil }}
+	if err := NewQueueRunner(consumer, processor, slog.New(slog.NewTextHandler(&logs, nil))).Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || processed != 1 || deleted != 1 {
+		t.Fatalf("receive=%d processed=%d deleted=%d", calls, processed, deleted)
+	}
+	if strings.Contains(logs.String(), "secret") {
+		t.Fatal("untrusted delivery logged")
+	}
+}
+
+func TestQueueRunnerDoesNotDeleteAfterSuccessfulProcessorCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	consumer := &runnerConsumer{receive: func(context.Context) (jobqueue.Delivery, error) {
+		return jobqueue.Delivery{Message: jobqueue.Message{JobID: runnerTestJobID}, ReceiptHandle: "receipt"}, nil
+	}, delete: func(context.Context, string) error { t.Fatal("deleted after cancellation"); return nil }}
+	processor := &runnerProcessor{process: func(context.Context, string) error { cancel(); return nil }}
+	if err := NewQueueRunner(consumer, processor, nil).Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestQueueRunnerDoesNotSpinAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0

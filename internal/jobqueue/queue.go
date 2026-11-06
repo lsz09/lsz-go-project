@@ -8,6 +8,9 @@ import (
 // ErrNoMessage indicates that a queue receive operation completed without a message.
 var ErrNoMessage = errors.New("no job queue message")
 
+// ErrInvalidDelivery identifies a received message that must remain unacknowledged.
+var ErrInvalidDelivery = errors.New("invalid job queue delivery")
+
 // Delivery contains a validated Message and the opaque token used to acknowledge it.
 type Delivery struct {
 	Message       Message

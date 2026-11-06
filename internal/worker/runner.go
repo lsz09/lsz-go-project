@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 
 	"cloudqueue/internal/jobqueue"
 )
@@ -57,7 +58,16 @@ func (r *QueueRunner) Run(ctx context.Context) error {
 			if errors.Is(err, jobqueue.ErrNoMessage) {
 				continue
 			}
+			if errors.Is(err, jobqueue.ErrInvalidDelivery) {
+				r.logger.Warn("queue message validation failed; message retained")
+				continue
+			}
 			return &runnerOperationError{operation: "run queue worker: receive message", cause: err}
+		}
+
+		if delivery.Message.Validate() != nil || strings.TrimSpace(delivery.ReceiptHandle) == "" {
+			r.logger.Warn("queue message validation failed; message retained")
+			continue
 		}
 
 		if err := r.processor.ProcessJob(ctx, delivery.Message.JobID); err != nil {
@@ -66,6 +76,9 @@ func (r *QueueRunner) Run(ctx context.Context) error {
 			}
 			r.logger.Error("queue job processing failed", "job_id", delivery.Message.JobID)
 			continue
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 
 		if err := r.consumer.Delete(ctx, delivery.ReceiptHandle); err != nil {

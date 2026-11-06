@@ -171,7 +171,8 @@ func execute(ctx context.Context, config configuration) error {
 		}
 
 		slog.Info("queue worker started")
-		if err := workerpkg.NewQueueRunner(consumer, processor, slog.Default()).Run(ctx); err != nil {
+		queuedProcessor := workerpkg.NewQueueProcessor(job.NewService(job.NewRepository(pool)), processor)
+		if err := workerpkg.NewQueueRunner(consumer, queuedProcessor, slog.Default()).Run(ctx); err != nil {
 			return err
 		}
 		return nil

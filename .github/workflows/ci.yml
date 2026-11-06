@@ -94,3 +94,10 @@ jobs:
           TEST_SQS_ENDPOINT_URL: http://localhost:4566
           TEST_AWS_REGION: ap-northeast-2
         run: go test -tags=integration -v -race ./...
+      - name: Verify queue initialization and configuration updates
+        env:
+          LOCALSTACK_CONTAINER: ${{ job.services.localstack.id }}
+        run: |
+          docker cp docker/localstack/init-aws.sh "$LOCALSTACK_CONTAINER:/tmp/init-aws.sh"
+          docker cp docker/localstack/test-init-aws.sh "$LOCALSTACK_CONTAINER:/tmp/test-init-aws.sh"
+          docker exec "$LOCALSTACK_CONTAINER" sh /tmp/test-init-aws.sh
