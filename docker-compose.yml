@@ -39,6 +39,8 @@ services:
       AWS_DEFAULT_REGION: ${AWS_REGION:-ap-northeast-2}
       SQS_ENDPOINT_STRATEGY: path
       SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-cloudqueue-jobs}
+      SQS_DLQ_NAME: ${SQS_DLQ_NAME-cloudqueue-jobs-dlq}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT-5}
 
     volumes:
       - ./docker/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
