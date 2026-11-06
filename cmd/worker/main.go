@@ -33,6 +33,7 @@ type configuration struct {
 	databaseURL      string
 	localStorageRoot string
 	sqs              *sqsqueue.Config
+	visibility       workerpkg.VisibilityConfig
 }
 
 // JobProcessor is the smallest Worker behavior required by the command.
@@ -64,7 +65,7 @@ func command(args []string, getenv func(string) string) int {
 		slog.Info(".env file was not loaded; using process environment", "error", err)
 	}
 
-	config, err := loadConfiguration(args, getenv)
+	config, err := loadConfiguration(args, getenv, os.LookupEnv)
 	if err != nil {
 		slog.Error("worker configuration is invalid", "error", err)
 		return 1
@@ -91,7 +92,7 @@ func command(args []string, getenv func(string) string) int {
 }
 
 // loadConfiguration validates CLI arguments and the environment without returning secrets.
-func loadConfiguration(args []string, getenv func(string) string) (configuration, error) {
+func loadConfiguration(args []string, getenv func(string) string, lookups ...func(string) (string, bool)) (configuration, error) {
 	if getenv == nil {
 		return configuration{}, errors.New("load configuration: environment lookup is required")
 	}
@@ -135,6 +136,14 @@ func loadConfiguration(args []string, getenv func(string) string) (configuration
 			return configuration{}, fmt.Errorf("load configuration: queue mode: %w", err)
 		}
 		config.sqs = &sqsConfig
+		lookup := func(key string) (string, bool) { value := getenv(key); return value, value != "" }
+		if len(lookups) > 0 && lookups[0] != nil {
+			lookup = lookups[0]
+		}
+		config.visibility, err = workerpkg.VisibilityConfigFromEnvironment(lookup)
+		if err != nil {
+			return configuration{}, fmt.Errorf("load configuration: queue mode: %w", err)
+		}
 	}
 	return config, nil
 }
@@ -172,7 +181,11 @@ func execute(ctx context.Context, config configuration) error {
 
 		slog.Info("queue worker started")
 		queuedProcessor := workerpkg.NewQueueProcessor(job.NewService(job.NewRepository(pool)), processor)
-		if err := workerpkg.NewQueueRunner(consumer, queuedProcessor, slog.Default()).Run(ctx); err != nil {
+		runner, runnerErr := workerpkg.NewQueueRunnerWithVisibility(consumer, queuedProcessor, consumer, slog.Default(), config.visibility)
+		if runnerErr != nil {
+			return &safeOperationError{operation: "run worker: configure visibility", cause: runnerErr}
+		}
+		if err := runner.Run(ctx); err != nil {
 			return err
 		}
 		return nil

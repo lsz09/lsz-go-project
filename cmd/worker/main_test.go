@@ -130,6 +130,31 @@ func TestRunForwardsContextAndJobID(t *testing.T) {
 	}
 }
 
+func TestVisibilityConfigurationOnlyForQueueMode(t *testing.T) {
+	values := map[string]string{
+		"DATABASE_URL": "postgres://localhost/test", "LOCAL_STORAGE_ROOT": "./data",
+		"AWS_REGION": "ap-northeast-2", "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test",
+		"SQS_ENDPOINT_URL": "http://localhost:4566", "SQS_QUEUE_URL": "http://localhost:4566/test", "SQS_WAIT_TIME_SECONDS": "10",
+		"SQS_VISIBILITY_TIMEOUT_SECONDS": "",
+	}
+	getenv := func(k string) string { return values[k] }
+	lookup := func(k string) (string, bool) { v, ok := values[k]; return v, ok }
+	if _, err := loadConfiguration(nil, getenv, lookup); err == nil {
+		t.Fatal("explicitly empty visibility setting accepted")
+	}
+	if _, err := loadConfiguration([]string{"-job-id", "one-shot"}, getenv, lookup); err != nil {
+		t.Fatalf("one-shot unexpectedly uses visibility setting: %v", err)
+	}
+	delete(values, "SQS_VISIBILITY_TIMEOUT_SECONDS")
+	config, err := loadConfiguration(nil, getenv, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.visibility.TimeoutSeconds != 60 || config.visibility.HeartbeatInterval != 20*time.Second {
+		t.Fatal("queue defaults not wired")
+	}
+}
+
 func TestRunPreservesProcessingErrors(t *testing.T) {
 	tests := []struct {
 		name  string

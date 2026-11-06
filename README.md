@@ -606,8 +606,8 @@ docker compose exec localstack awslocal sqs list-queues
 메시지 본문과 ReceiptHandle은 로그에 기록하지 않습니다.
 
 FAILED는 최종 상태이므로 메시지가 재전달되어도 Job을 재실행하지 않습니다.
-DLQ 자동 복원, 실패 Job 자동 재실행, 고아 PROCESSING 복구 및 Visibility Timeout
-자동 연장은 아직 지원하지 않습니다.
+DLQ 자동 복원, 실패 Job 자동 재실행 및 고아 PROCESSING 복구는 아직 지원하지 않습니다.
+처리 중 Visibility Timeout은 아래 heartbeat 설정으로 자동 연장합니다.
 
 ### Queue 설정 및 DLQ 확인
 
@@ -642,6 +642,84 @@ go test -tags=integration -v ./cmd/worker -run TestQueueWorkerRedriveIntegration
 초기화 스크립트의 재실행·설정 갱신·기존 메시지 보존·잘못된 설정 거부도 확인합니다.
 
 정책 참고: [AWS SQS DLQ 문서](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+
+## 처리 중 Visibility Timeout 자동 연장
+
+Queue Worker는 유효한 메시지를 수신하면 Job 처리 전에 해당 메시지의 Visibility
+Timeout을 설정하고, 처리 중 heartbeat로 계속 갱신합니다. 원본 Queue의 기본 30초
+설정과 달리 개별 Delivery에만 적용되며, 메시지가 재수신되면 Queue 기본값으로 돌아갑니다.
+
+```dotenv
+SQS_VISIBILITY_TIMEOUT_SECONDS=60
+SQS_VISIBILITY_HEARTBEAT_SECONDS=20
+```
+
+설정을 생략하면 메시지를 60초 동안 숨기고 20초 간격으로 갱신합니다. 명시적으로
+빈 값, 정수가 아닌 값, 0 및 음수는 거부합니다. timeout은 1~43200초 범위에서
+검증하며, 실제 환경변수 조합은 heartbeat와 요청 예산에 대한 여유도 만족해야 합니다.
+연장 API 호출의 제한 시간은 5초로 고정하고, **heartbeat + 2 × 요청 제한 시간 <
+visibility timeout**인 설정만 허용합니다. 예를 들어 timeout 30초·heartbeat 20초는
+여유 부족으로 거부합니다. 이 조건은 네트워크나 스케줄러 지연에 대한 완전한 보장은 아닙니다.
+
+`SQS_WAIT_TIME_SECONDS`는 빈 Queue의 Receive long polling 대기 시간이며 heartbeat와
+별개입니다. 기존 `-job-id` one-shot 모드에서는 새 환경변수를 읽지 않습니다.
+
+```text
+유효한 Delivery 수신
+→ 최초 Visibility Timeout 설정
+→ QueueProcessor 실행 + heartbeat
+→ 처리 종료
+→ heartbeat 중단·진행 중인 API 취소·goroutine 종료 확인
+→ 처리 성공·연장 오류 없음·Context 유효인 경우에만 Delete
+```
+
+최초 연장 실패 시 Job을 시작하지 않고, 메시지를 남긴 채 Worker가 오류 종료합니다.
+처리 중 연장이 실패하거나 연장 API 요청이 시간 제한을 초과하면 처리 Context를
+취소하고, 처리와 heartbeat의 종료를 확인한 뒤 메시지를 남기고 오류 종료합니다.
+연장 요청은 SDK 재시도도 1회 시도로 제한하며 애플리케이션 수준의 재시도는 하지 않습니다.
+
+Job 처리 자체가 실패하면 heartbeat를 중단하고 다음 메시지를 처리합니다. 이미
+COMPLETED인 Job은 재분석 없이 삭제하며 FAILED·PROCESSING·미존재 Job의 메시지는
+삭제하지 않습니다. 잘못된 메시지는 연장하지 않고 기존 DLQ 정책을 따릅니다.
+
+Ctrl+C, SIGINT 및 SIGTERM은 처리와 진행 중인 연장을 취소합니다. 정상 종료를 위한
+취소만 발생했다면 장애로 기록하지 않습니다. 처리 종료와 실제 연장 오류가 겹쳐도
+연장 오류를 확인한 후 삭제 여부를 결정하며, 처리 오류가 함께 발생하면 원인도 보존합니다.
+Processor와 외부 Adapter는 Context 취소를 관찰해야 정상 종료할 수 있습니다.
+
+### 제한 사항
+
+- SQS는 수신 시점부터 최대 12시간의 visibility 제한을 적용하므로 heartbeat로 무기한
+  연장할 수 없습니다. 남은 허용 시간보다 긴 연장을 요청하면 SQS가 오류를 반환하고
+  Worker는 위 연장 실패 정책을 따릅니다. 최대값 43200초도 실제 남은 시간에 따라 실패할 수 있습니다.
+- 연장은 중복 전달 가능성을 낮추지만 exactly-once 처리를 보장하지 않습니다.
+  기존 DB 상태 조회와 원자적 PENDING 획득을 유지합니다.
+- 취소 시 Job이 PROCESSING으로 남거나, 완료 직후 연장 오류로 COMPLETED 메시지가
+  남을 수 있습니다. 자동 복구는 포함하지 않으며 완료된 Job의 재전달은 기존 중복 처리 정책으로 처리합니다.
+- 메시지를 삭제하지 않을 때 숨김 시간을 0으로 되돌리지 않습니다. 마지막으로 성공한
+  연장의 시간이 지나면 메시지가 다시 보일 수 있습니다.
+
+### 테스트
+
+```powershell
+go test ./internal/worker ./internal/jobqueue/sqsqueue ./cmd/worker
+```
+
+단위 테스트는 가상 시간(`testing/synctest`)과 채널로 연장 주기, API timeout, 처리
+완료와 연장 실패의 경쟁 상황, 정상 종료 및 goroutine 종료를 검증합니다.
+
+전용 PostgreSQL·LocalStack을 실행하고 통합 테스트 환경변수를 설정한 뒤 실행합니다.
+
+```powershell
+go test -tags=integration -v ./cmd/worker -run TestVisibilityHeartbeatIntegration
+```
+
+Queue 기본 visibility 1초, 최초 연장 2초, heartbeat 250ms를 사용해 실제 로그 처리를
+3초 이상 유지합니다. 이 동안 경쟁 Consumer가 메시지를 받지 못하는지 확인하고,
+성공 시 결과 파일 생성·메시지 삭제, 실패 시 연장 중단·메시지 재전달을 검증합니다.
+검증 중 다른 Consumer가 메시지를 받으면 수신 횟수에 영향을 준다는 점도 고려합니다.
+
+참고: [AWS ChangeMessageVisibility 문서](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibility.html)
 
 ## 로그 파일 업로드
 

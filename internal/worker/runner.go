@@ -17,9 +17,11 @@ type JobProcessor interface {
 
 // QueueRunner continuously receives queued Jobs and acknowledges only successful work.
 type QueueRunner struct {
-	consumer  jobqueue.Consumer
-	processor JobProcessor
-	logger    *slog.Logger
+	consumer   jobqueue.Consumer
+	processor  JobProcessor
+	logger     *slog.Logger
+	extender   jobqueue.VisibilityExtender
+	visibility *VisibilityConfig
 }
 
 // NewQueueRunner creates a long-running queue Worker.
@@ -70,7 +72,14 @@ func (r *QueueRunner) Run(ctx context.Context) error {
 			continue
 		}
 
-		if err := r.processor.ProcessJob(ctx, delivery.Message.JobID); err != nil {
+		processErr, visibilityErr := r.processDelivery(ctx, delivery)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if visibilityErr != nil {
+			return visibilityErr
+		}
+		if processErr != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
