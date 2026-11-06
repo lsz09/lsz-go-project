@@ -27,3 +27,8 @@ type Consumer interface {
 	Receive(ctx context.Context) (Delivery, error)
 	Delete(ctx context.Context, receiptHandle string) error
 }
+
+// VisibilityExtender renews the lease for the most recently received delivery.
+type VisibilityExtender interface {
+	ExtendVisibility(ctx context.Context, receiptHandle string, timeoutSeconds int32) error
+}
