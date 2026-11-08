@@ -62,7 +62,10 @@ func TestLoadConfiguration(t *testing.T) {
 			if name == "DATABASE_URL" {
 				return "postgres://localhost/database"
 			}
-			return "  "
+			if name == "LOCAL_STORAGE_ROOT" {
+				return "  "
+			}
+			return ""
 		}, wantErr: "LOCAL_STORAGE_ROOT is required"},
 		{name: "queue mode missing SQS configuration", getenv: func(name string) string {
 			if name == "DATABASE_URL" || name == "LOCAL_STORAGE_ROOT" {
@@ -127,6 +130,18 @@ func TestRunForwardsContextAndJobID(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("processor was not called")
+	}
+}
+
+func TestS3OneShotConfigurationDoesNotRequireLocalStorageOrSQS(t *testing.T) {
+	values := map[string]string{"DATABASE_URL": "postgres://localhost/test", "STORAGE_BACKEND": "s3", "S3_ENDPOINT_URL": "http://localhost:4566", "S3_BUCKET_NAME": "test-bucket", "S3_USE_PATH_STYLE": "true", "AWS_REGION": "ap-northeast-2", "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
+	lookup := func(k string) (string, bool) { v, ok := values[k]; return v, ok }
+	config, err := loadConfiguration([]string{"-job-id", "one-shot"}, func(k string) string { return values[k] }, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.storage.Backend != "s3" || config.localStorageRoot != "" || config.sqs != nil {
+		t.Fatal("one-shot storage selection incorrect")
 	}
 }
 

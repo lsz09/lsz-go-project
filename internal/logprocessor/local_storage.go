@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
+
+	"cloudqueue/internal/storagekey"
 )
 
 const localCopyBufferSize = 32 * 1024
@@ -163,15 +164,8 @@ func (s *LocalStorage) resolve(key string) (string, error) {
 
 // validateStorageKey rejects absolute, platform-specific, and escaping object keys.
 func validateStorageKey(key string) error {
-	if strings.TrimSpace(key) == "" || strings.ContainsRune(key, '\x00') {
-		return fmt.Errorf("storage key is required: %w", ErrInvalidInput)
-	}
-	if strings.Contains(key, `\`) || path.IsAbs(key) || filepath.IsAbs(key) || filepath.VolumeName(key) != "" {
-		return fmt.Errorf("storage key must be relative: %w", ErrInvalidInput)
-	}
-	cleaned := path.Clean(key)
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return fmt.Errorf("storage key escapes root: %w", ErrInvalidInput)
+	if err := storagekey.Validate(key); err != nil {
+		return fmt.Errorf("validate storage key: %w", errors.Join(ErrInvalidInput, err))
 	}
 	return nil
 }
