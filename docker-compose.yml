@@ -35,21 +35,23 @@ services:
       - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
 
     environment:
-      SERVICES: sqs
+      SERVICES: sqs,s3
       AWS_DEFAULT_REGION: ${AWS_REGION:-ap-northeast-2}
       SQS_ENDPOINT_STRATEGY: path
       SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-cloudqueue-jobs}
       SQS_DLQ_NAME: ${SQS_DLQ_NAME-cloudqueue-jobs-dlq}
       SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT-5}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME-cloudqueue-files}
 
     volumes:
       - ./docker/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+      - ./docker/localstack/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh:ro
 
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "awslocal sqs get-queue-url --queue-name $${SQS_QUEUE_NAME} >/dev/null 2>&1",
+          "awslocal sqs get-queue-url --queue-name $${SQS_QUEUE_NAME} >/dev/null 2>&1 && awslocal s3api head-bucket --bucket $${S3_BUCKET_NAME} >/dev/null 2>&1",
         ]
       interval: 5s
       timeout: 3s

@@ -22,6 +22,7 @@ import (
 	"cloudqueue/internal/jobqueue/sqsqueue"
 	"cloudqueue/internal/loganalysis"
 	"cloudqueue/internal/logprocessor"
+	"cloudqueue/internal/storage"
 	workerpkg "cloudqueue/internal/worker"
 )
 
@@ -34,6 +35,7 @@ type configuration struct {
 	localStorageRoot string
 	sqs              *sqsqueue.Config
 	visibility       workerpkg.VisibilityConfig
+	storage          storage.Config
 }
 
 // JobProcessor is the smallest Worker behavior required by the command.
@@ -120,15 +122,20 @@ func loadConfiguration(args []string, getenv func(string) string, lookups ...fun
 	if strings.TrimSpace(databaseURL) == "" {
 		return configuration{}, errors.New("load configuration: DATABASE_URL is required")
 	}
-	localStorageRoot := getenv("LOCAL_STORAGE_ROOT")
-	if strings.TrimSpace(localStorageRoot) == "" {
-		return configuration{}, errors.New("load configuration: LOCAL_STORAGE_ROOT is required")
+	lookup := func(key string) (string, bool) { value := getenv(key); return value, value != "" }
+	if len(lookups) > 0 && lookups[0] != nil {
+		lookup = lookups[0]
+	}
+	storageConfig, err := storage.ConfigFromEnvironment(lookup)
+	if err != nil {
+		return configuration{}, fmt.Errorf("load configuration: storage: %w", err)
 	}
 
 	config := configuration{
 		jobID:            *jobID,
 		databaseURL:      databaseURL,
-		localStorageRoot: localStorageRoot,
+		localStorageRoot: storageConfig.LocalRoot,
+		storage:          storageConfig,
 	}
 	if !jobIDProvided {
 		sqsConfig, err := sqsqueue.ConfigFromEnvironment(getenv)
@@ -136,10 +143,6 @@ func loadConfiguration(args []string, getenv func(string) string, lookups ...fun
 			return configuration{}, fmt.Errorf("load configuration: queue mode: %w", err)
 		}
 		config.sqs = &sqsConfig
-		lookup := func(key string) (string, bool) { value := getenv(key); return value, value != "" }
-		if len(lookups) > 0 && lookups[0] != nil {
-			lookup = lookups[0]
-		}
 		config.visibility, err = workerpkg.VisibilityConfigFromEnvironment(lookup)
 		if err != nil {
 			return configuration{}, fmt.Errorf("load configuration: queue mode: %w", err)
@@ -166,7 +169,13 @@ func execute(ctx context.Context, config configuration) error {
 	defer pool.Close()
 
 	slog.Info("connected to PostgreSQL")
-	processor := newJobProcessor(pool, config.localStorageRoot)
+	storageContext, storageCancel := context.WithTimeout(ctx, startupTimeout)
+	objectStorage, storageErr := storage.New(storageContext, config.storage)
+	storageCancel()
+	if storageErr != nil {
+		return &safeOperationError{operation: "run worker: configure storage", cause: storageErr}
+	}
+	processor := newJobProcessorWithStorage(pool, objectStorage)
 	if config.sqs != nil {
 		startupContext, cancel = context.WithTimeout(ctx, startupTimeout)
 		client, clientErr := sqsqueue.NewClient(startupContext, *config.sqs)
@@ -200,11 +209,14 @@ func execute(ctx context.Context, config configuration) error {
 
 // newJobProcessor wires the existing Repository, Service, Processor, and Worker.
 func newJobProcessor(pool *pgxpool.Pool, localStorageRoot string) JobProcessor {
+	return newJobProcessorWithStorage(pool, logprocessor.NewLocalStorage(localStorageRoot))
+}
+
+func newJobProcessorWithStorage(pool *pgxpool.Pool, objectStorage logprocessor.Storage) JobProcessor {
 	jobRepository := job.NewRepository(pool)
 	jobService := job.NewService(jobRepository)
-	localStorage := logprocessor.NewLocalStorage(localStorageRoot)
 	analyzer := loganalysis.New()
-	processor := logprocessor.New(localStorage, analyzer)
+	processor := logprocessor.New(objectStorage, analyzer)
 	return workerpkg.New(jobService, processor)
 }
 

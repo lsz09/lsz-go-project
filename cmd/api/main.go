@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -17,7 +16,7 @@ import (
 	"cloudqueue/internal/jobqueue/sqsqueue"
 	"cloudqueue/internal/jobsubmission"
 	"cloudqueue/internal/jobupload"
-	"cloudqueue/internal/logprocessor"
+	"cloudqueue/internal/storage"
 )
 
 func main() {
@@ -32,9 +31,9 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	storageRoot := os.Getenv("LOCAL_STORAGE_ROOT")
-	if strings.TrimSpace(storageRoot) == "" {
-		slog.Error("LOCAL_STORAGE_ROOT environment variable is required")
+	storageConfig, err := storage.ConfigFromEnvironment(os.LookupEnv)
+	if err != nil {
+		slog.Error("invalid storage configuration", "error", err)
 		os.Exit(1)
 	}
 
@@ -54,6 +53,12 @@ func main() {
 		context.Background(),
 		10*time.Second,
 	)
+	objectStorage, err := storage.New(startupContext, storageConfig)
+	if err != nil {
+		cancel()
+		slog.Error("failed to configure storage", "error", err)
+		os.Exit(1)
+	}
 
 	pool, err := database.Open(startupContext, databaseURL)
 
@@ -87,7 +92,7 @@ func main() {
 	jobRepository := job.NewRepository(pool)
 	jobService := job.NewService(jobRepository)
 	jobSubmissionService := jobsubmission.NewService(jobService, sqsPublisher)
-	jobUploadService := jobupload.NewService(logprocessor.NewLocalStorage(storageRoot), jobSubmissionService)
+	jobUploadService := jobupload.NewService(objectStorage, jobSubmissionService)
 	jobHandler := job.NewHandlerWithUploader(jobSubmissionService, jobUploadService)
 
 	server := &http.Server{

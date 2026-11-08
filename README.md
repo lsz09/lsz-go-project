@@ -28,6 +28,7 @@ Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
 - [x] 메시지 큐 기반 비동기 Worker
 - [x] 메시지 큐
 - [x] 로컬 로그 파일 업로드 및 Job 생성
+- [x] LocalStack 기반 S3 Storage 및 API·Worker 연동
 - [ ] AWS 배포
 - [ ] Observability
 
@@ -412,8 +413,8 @@ NUL 문자 및 `..`를 통해 root 밖으로 이동하는 경로는 `ErrInvalidI
 정리합니다.
 
 Processor는 Job 상태를 직접 변경하지 않습니다. Worker가 상태 전이를 담당하며,
-Processor는 성공 시 `results/{job-id}.json` 키만 반환합니다. 현재는 로컬 Storage만
-지원하고 S3 구현은 후속 작업에서 같은 Storage 인터페이스에 연결합니다.
+Processor는 성공 시 `results/{job-id}.json` 키만 반환합니다. 로컬 파일과 S3 Storage를
+같은 인터페이스로 지원하며 저장 방식은 실행 환경변수로 선택합니다.
 
 ## 로컬 Worker 실행
 
@@ -721,11 +722,152 @@ Queue 기본 visibility 1초, 최초 연장 2초, heartbeat 250ms를 사용해 �
 
 참고: [AWS ChangeMessageVisibility 문서](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibility.html)
 
+## LocalStack S3 Storage
+
+API와 Worker는 공통 `internal/storage` 설정 및 Factory로 저장소를 구성합니다.
+`STORAGE_BACKEND` 생략 시 기존 로컬 모드가 적용되고, 명시적으로 빈 값이나
+지원하지 않는 backend는 시작 단계에서 거부합니다.
+
+로컬 모드:
+
+```dotenv
+STORAGE_BACKEND=local
+LOCAL_STORAGE_ROOT=./data
+```
+
+S3 모드:
+
+```dotenv
+STORAGE_BACKEND=s3
+S3_ENDPOINT_URL=http://localhost:4566
+S3_BUCKET_NAME=cloudqueue-files
+S3_USE_PATH_STYLE=true
+AWS_REGION=ap-northeast-2
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
+```
+
+local 모드에서는 S3 설정을 요구하지 않고, s3 모드에서는 `LOCAL_STORAGE_ROOT`를
+요구하지 않습니다. S3 endpoint는 인증정보·query·경로가 없는 HTTP(S) origin으로
+설정합니다. `S3_USE_PATH_STYLE` 생략 시 LocalStack용 true를 사용하며 잘못된 boolean은
+거부합니다. API와 Worker는 동일한 backend·버킷·region을 사용해야 합니다.
+
+Compose의 LocalStack은 `sqs,s3` 서비스를 함께 실행합니다. `init-s3.sh`는 인증된
+버킷 목록 조회가 성공한 경우에만 기존 버킷 유무를 판단하고, 버킷이 없을 때 생성합니다.
+재실행해도 기존 객체를 삭제하지 않습니다. API와 Worker는 버킷을 자동 생성하지 않습니다.
+
+```powershell
+docker compose up -d
+docker compose exec localstack sh /etc/localstack/init/ready.d/init-s3.sh
+docker compose exec localstack awslocal s3api list-buckets
+```
+
+DB Migration 적용 후 API와 Worker를 각각 실행하고 파일을 업로드합니다.
+
+```powershell
+go run ./cmd/api
+```
+
+다른 터미널에서:
+
+```powershell
+go run ./cmd/worker
+```
+
+파일 업로드:
+
+```powershell
+curl.exe -X POST http://localhost:8080/api/v1/jobs -F "file=@access.log"
+```
+
+기존 JSON Job 생성과 one-shot 실행도 같은 backend를 사용합니다.
+
+```powershell
+go run ./cmd/worker -job-id {job-id}
+```
+
+### 객체 구조와 구현
+
+```text
+cloudqueue-files/
+├── uploads/{upload-id}/access.log
+└── results/{job-id}.json
+```
+
+Job에는 버킷 URL이 아니라 기존 `file_key`와 `result_key`만 저장합니다. `internal/s3storage`가
+GetObject·PutObject·DeleteObject를 구현하고 AWS SDK 타입은 공통 Storage 계약에 노출하지
+않습니다. 로컬과 S3가 같은 key 검증을 사용하며 절대경로·역슬래시·드라이브명·NUL 및
+`..` 경로 구간을 거부합니다. 업로드 원본 파일명 검증과 10 MiB/11 MiB 제한도 유지됩니다.
+
+Open은 응답 Body를 스트리밍 Reader로 반환하며 호출자가 닫습니다. Put은 임의의
+Reader를 32 KiB 버퍼로 권한이 제한된 임시 파일에 복사한 뒤, 길이를 아는 seekable
+Body로 단일 PutObject를 호출합니다. SDK의 서명·길이 계산을 지원하면서 전체 객체를
+메모리에 추가로 복사하지 않기 위한 선택입니다. 입력 Reader는 닫지 않으며 임시 파일은
+성공·실패 모두 닫고 삭제합니다. multipart S3 업로드는 사용하지 않습니다.
+
+따라서 s3 모드에서도 쓰기 가능한 임시 디스크 공간이 필요합니다. HTTP multipart 파싱의
+임시 파일과 S3 업로드 준비용 파일이 동시에 존재할 수 있습니다. Context 취소는 SDK와
+입력 복사에 전달되고, 오류는 원인을 보존하면서 응답·로그·Job 오류에 안전한 단계만 표시합니다.
+
+### 실패 및 객체 정리
+
+| 상황 | 동작 |
+| --- | --- |
+| 입력 저장 실패 | Job 미생성, 해당 요청 입력 객체 정리 시도 |
+| Job 미생성이 확실한 실패 | 입력 객체 정리 |
+| DB 저장 결과 불확실·SQS 발행 실패 | 입력 객체 보존 |
+| 입력 읽기·로그 분석·결과 저장 실패 | 기존 Worker FAILED 처리, 메시지 미삭제 |
+| 결과 저장 후 DB 완료 기록 실패 | 결과 객체 보존, 메시지 미삭제 |
+
+정리는 해당 요청이 만든 고유한 key만 대상으로 합니다. 버킷 전체나 prefix를 삭제하지
+않으며, 원래 오류와 정리 실패를 함께 보존합니다. 성공 Job의 입력·결과 객체는 유지합니다.
+저장 결과가 불확실한 오류나 프로세스 강제 종료 시 객체·임시 파일이 남을 수 있고,
+고아 객체 자동 정리는 아직 지원하지 않습니다. SQS heartbeat·DLQ·중복 메시지 정책은 유지됩니다.
+
+### 객체 확인
+
+기본 버킷 이름을 변경했다면 아래 명령도 함께 수정합니다.
+
+```powershell
+docker compose exec localstack awslocal s3api list-objects-v2 --bucket cloudqueue-files
+docker compose exec localstack awslocal s3 cp s3://cloudqueue-files/results/{job-id}.json -
+```
+
+로컬 파일은 S3로 자동 이전되지 않습니다. backend를 변경하면 기존 Job의 key가 다른
+저장소를 가리키므로, 기존 Job을 처리하려면 해당 입력 객체를 먼저 이전해야 합니다.
+Job별 backend 구분은 지원하지 않습니다. 현재 Compose는 LocalStack 데이터 영속화를
+구성하지 않으므로 컨테이너 재생성 시 객체가 사라질 수 있습니다. 실제 AWS 배포와
+IAM 구성은 이번 구현에 포함되지 않습니다.
+
+### 테스트
+
+```powershell
+go test ./internal/s3storage ./internal/storage ./internal/logprocessor ./cmd/worker
+```
+
+전용 PostgreSQL과 SQS·S3가 활성화된 LocalStack을 실행한 뒤 설정합니다.
+
+```powershell
+$env:TEST_DATABASE_URL = "postgres://cloudqueue_test:${testPassword}@localhost:55433/cloudqueue_test?sslmode=disable"
+$env:TEST_SQS_ENDPOINT_URL = "http://localhost:4566"
+$env:TEST_S3_ENDPOINT_URL = "http://localhost:4566"
+$env:TEST_AWS_REGION = "ap-northeast-2"
+go test -tags=integration -v ./cmd/worker -run 'TestS3UploadedJobIntegration|TestS3OneShotCommandIntegration'
+Remove-Item Env:TEST_DATABASE_URL, Env:TEST_SQS_ENDPOINT_URL, Env:TEST_S3_ENDPOINT_URL, Env:TEST_AWS_REGION
+```
+
+테스트는 고유한 버킷·객체·Queue·DB Schema만 생성·정리합니다. 실제 multipart 업로드부터
+S3 입력 확인·SQS 수신·heartbeat Worker·S3 결과 통계·메시지 삭제를 검증하며, 잘못된 로그,
+입력 누락, 결과 저장 실패, 발행 실패 시 객체 보존 및 실제 one-shot 명령 조립도 확인합니다.
+CI는 S3를 활성화한 전체 integration race 검사와 초기화 스크립트 검증을 수행합니다.
+
+SDK 참고: [AWS SDK for Go v2 S3 입력 Body 문서](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/sdk-utilities-s3.html)
+
 ## 로그 파일 업로드
 
 `POST /api/v1/jobs`는 기존 JSON 요청과 함께 `multipart/form-data` 파일 업로드를
-지원합니다. API와 Worker에 동일한 `LOCAL_STORAGE_ROOT`를 설정해야 합니다.
-API 시작 시에도 이 환경변수가 필수입니다.
+지원합니다. local 모드에서는 API와 Worker에 동일한 `LOCAL_STORAGE_ROOT`를 설정해야 합니다.
+s3 모드에서는 위의 S3 Storage 절에 따라 동일한 버킷을 설정합니다.
 
 PostgreSQL과 LocalStack을 실행하고 Migration을 적용한 뒤 API와 Worker를 각각 실행합니다.
 
@@ -844,7 +986,7 @@ Remove-Item Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
 테스트는 메시지 발행, 수신, 삭제, 잘못된 body 거부 및 long polling Context 취소를
 검증합니다.
 
-### Job 생성 API·큐 Worker·PostgreSQL·SQS 통합 테스트
+### Job 생성 API·큐 Worker·PostgreSQL·SQS·S3 통합 테스트
 
 위의 테스트용 PostgreSQL과 LocalStack을 함께 실행한 상태에서 두 테스트 환경변수를
 모두 설정합니다. 테스트는 HTTP 요청으로 생성된 Job이 PostgreSQL에 `PENDING`으로
@@ -857,8 +999,9 @@ Remove-Item Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
 $env:TEST_DATABASE_URL = "postgres://cloudqueue_test:${testPassword}@localhost:55433/cloudqueue_test?sslmode=disable"
 $env:TEST_SQS_ENDPOINT_URL = "http://localhost:4566"
 $env:TEST_AWS_REGION = "ap-northeast-2"
+$env:TEST_S3_ENDPOINT_URL = "http://localhost:4566"
 go test -tags=integration -v ./internal/jobsubmission ./cmd/worker
-Remove-Item Env:TEST_DATABASE_URL, Env:TEST_SQS_ENDPOINT_URL, Env:TEST_AWS_REGION
+Remove-Item Env:TEST_DATABASE_URL, Env:TEST_SQS_ENDPOINT_URL, Env:TEST_S3_ENDPOINT_URL, Env:TEST_AWS_REGION
 ```
 
 ## 종료
