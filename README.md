@@ -2,8 +2,62 @@
 
 Go와 AWS를 활용한 비동기 파일 처리 및 작업 관리 플랫폼입니다.
 
+An asynchronous file-processing and job-management platform built with Go and AWS
+(SQS and S3 on LocalStack).
+
 사용자가 파일 처리 작업을 요청하면 API 서버가 작업을 메시지 큐에 전달하고,
 Worker가 비동기로 처리한 후 결과와 작업 상태를 저장합니다.
+
+## 프로젝트 요약 / Summary
+
+### 전체 흐름 / Architecture
+
+```text
+Client
+  │  POST /api/v1/jobs (JSON 또는 로그 파일 업로드)
+  ▼
+API 서버 (cmd/api) ──► PostgreSQL: Job을 PENDING으로 저장
+  │                 ──► S3: 업로드한 로그 파일 저장
+  ▼
+SQS (cloudqueue-jobs) ──► 실패가 반복된 메시지는 DLQ (cloudqueue-jobs-dlq)
+  │
+  ▼
+Worker (cmd/worker): long polling으로 수신
+  │  PROCESSING → 로그 분석 → 결과 JSON을 S3에 저장
+  ▼
+PostgreSQL: COMPLETED 또는 FAILED로 갱신 → 성공한 메시지만 SQS에서 삭제
+```
+
+### 기술 스택 / Tech Stack
+
+Go · PostgreSQL 17 · AWS SDK for Go v2 · Amazon SQS · Amazon S3 · LocalStack ·
+Docker Compose · golang-migrate · GitHub Actions
+
+### 구현한 것 / What I Built
+
+- **REST API**: 작업 생성, 목록·단건 조회, 로그 파일 업로드(`multipart/form-data`),
+  `/health`·`/ready` 상태 확인
+  <br>REST API for creating, listing, and fetching jobs, uploading log files, and health/readiness checks
+- **작업 상태 관리**: `PENDING → PROCESSING → COMPLETED / FAILED`를 원자적 UPDATE로
+  제한해, 여러 Worker가 같은 작업을 동시에 가져가도 하나만 처리
+  <br>Job state transitions enforced with atomic UPDATEs, so only one worker can claim a job
+- **SQS 비동기 처리**: long polling 수신, 처리 성공 후에만 메시지 삭제, 재전달 제한과 DLQ,
+  처리 중 Visibility Timeout 자동 연장(heartbeat)
+  <br>Asynchronous processing with SQS: delete-on-success, redrive policy with a DLQ, and visibility-timeout heartbeats
+- **스토리지**: 로컬 파일과 S3를 같은 인터페이스로 지원하고, 임시 파일에 쓴 뒤 rename해
+  불완전한 결과 파일이 남지 않게 함
+  <br>Local and S3 storage behind one interface, with temp-file-then-rename writes
+- **웹 서버 로그 분석**: Nginx·Apache Combined Log Format에서 요청 수, 오류율,
+  상태 코드·Method·endpoint별 요청 수 집계
+  <br>Web server log analysis (request counts, error rate, per-status/method/endpoint stats)
+- **테스트와 CI**: 단위 테스트, PostgreSQL·LocalStack 통합 테스트, GitHub Actions에서
+  gofmt·go vet·race 테스트·빌드 자동 실행
+  <br>Unit and integration tests (PostgreSQL, LocalStack) run in GitHub Actions with gofmt, go vet, and the race detector
+
+### 다음 단계 / Next Steps
+
+- 실제 AWS 환경에 배포 / Deploy to real AWS
+- 로그·메트릭 수집(Observability) / Add observability
 
 ## 현재 구현 상태
 
